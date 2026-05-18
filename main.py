@@ -21,9 +21,14 @@ OWNER_ID = int(os.environ["OWNER_TELEGRAM_ID"])
 SHEETS_ID = os.environ["GOOGLE_SHEETS_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
+QUALIFY_USER_ID = 514275093
+
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Состояние ожидания причины: chat_id -> {'row': int, 'qualified': bool}
+pending_reason: dict = {}
 
 
 def get_sheets_service():
@@ -55,7 +60,11 @@ def answer_callback(callback_query_id, text=""):
 def edit_message_reply_markup(chat_id, message_id):
     requests.post(
         f"{API_BASE}/editMessageReplyMarkup",
-        json={"chat_id": chat_id, "message_id": message_id, "reply_markup": json.dumps({"inline_keyboard": []})},
+        json={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": json.dumps({"inline_keyboard": []}),
+        },
         timeout=10,
     )
 
@@ -87,6 +96,17 @@ def insert_row_to_sheet(date_str, name, phone):
     logger.info("Row inserted: date=%s name=%s phone=%s", date_str, name, phone)
 
 
+def update_reason_in_sheet(row_num, reason):
+    sheets = get_sheets_service()
+    sheets.values().update(
+        spreadsheetId=SHEETS_ID,
+        range=f"E{row_num}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[reason]]},
+    ).execute()
+    logger.info("Reason saved to E%d: %s", row_num, reason)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     logger.info("POST /webhook received")
@@ -108,9 +128,33 @@ def webhook():
 
 def handle_message(msg):
     sender = msg.get("from", {})
+    chat_id = msg.get("chat", {}).get("id") or sender.get("id")
+    text_body = msg.get("text", "")
+
+    # Если ждём причину от пользователя-квалификатора
+    if chat_id in pending_reason and text_body:
+        state = pending_reason.pop(chat_id)
+        row_num = state["row"]
+        qualified = state["qualified"]
+        reason = text_body.strip()
+
+        label = "Квалифицированный ✅" if qualified else "Не квалифицированный ❌"
+        full_reason = f"{label}: {reason}"
+
+        try:
+            update_reason_in_sheet(row_num, full_reason)
+            send_message(chat_id, f"✅ Причина сохранена в таблицу!\n<i>{full_reason}</i>")
+            logger.info("Reason saved row=%d qualified=%s reason=%s", row_num, qualified, reason)
+        except Exception as exc:
+            logger.error("Failed to save reason: %s", exc)
+            send_message(chat_id, f"❌ Ошибка сохранения причины: {exc}")
+        return
+
+    # Иначе — обычная обработка контакта
     username = sender.get("username")
     sender_display = f"@{username}" if username else (
-        f"{sender.get('first_name', '')} {sender.get('last_name', '')}".strip() or str(sender.get("id", "?"))
+        f"{sender.get('first_name', '')} {sender.get('last_name', '')}".strip()
+        or str(sender.get("id", "?"))
     )
     date_str = datetime.now().strftime("%d.%m.%Y")
 
@@ -121,9 +165,7 @@ def handle_message(msg):
         last_name = contact.get("last_name", "")
         name = f"{first_name} {last_name}".strip() or sender_display
     else:
-        # Обработка текстового сообщения с phone_number entity
         entities = msg.get("entities", [])
-        text_body = msg.get("text", "")
         phone = None
         for ent in entities:
             if ent.get("type") == "phone_number":
@@ -143,7 +185,6 @@ def handle_message(msg):
         f"📅 Дата: {date_str}"
     )
 
-    # callback_data ограничен 64 байтами — обрезаем имя если нужно
     fixed = f"save|{date_str}||{phone}"
     max_name_len = 64 - len(fixed.encode())
     name_safe = name[:max_name_len] if len(name.encode()) > max_name_len else name
@@ -178,11 +219,50 @@ def handle_callback(cb):
                 insert_row_to_sheet(date_str, name, phone)
                 send_message(chat_id, f"✅ Записано в таблицу!\n📞 {phone} — {name}")
                 logger.info("Saved to sheet: %s %s %s", date_str, name, phone)
+
+                # Отправляем лид на квалификацию пользователю 514275093
+                qual_text = (
+                    f"📋 <b>Новый лид на квалификацию</b>\n"
+                    f"📞 Телефон: <code>{phone}</code>\n"
+                    f"👤 Имя: {name}\n"
+                    f"📅 Дата: {date_str}\n\n"
+                    f"Квалифицированный?"
+                )
+                # callback_data: qual|yes|4 или qual|no|4  (row=4)
+                qual_keyboard = {
+                    "inline_keyboard": [[
+                        {"text": "✅ Квалифицированный", "callback_data": "qual|yes|4"},
+                        {"text": "❌ Не квалифицированный", "callback_data": "qual|no|4"},
+                    ]]
+                }
+                send_message(QUALIFY_USER_ID, qual_text, reply_markup=qual_keyboard)
+                logger.info("Qual message sent to %d for phone=%s", QUALIFY_USER_ID, phone)
+
             except Exception as exc:
                 logger.error("Failed to insert row: %s", exc)
                 send_message(chat_id, f"❌ Ошибка записи в таблицу: {exc}")
         else:
             send_message(chat_id, "❌ Ошибка: неверный формат данных.")
+
+    elif cb_data.startswith("qual|"):
+        # qual|yes|4 или qual|no|4
+        parts = cb_data.split("|")
+        if len(parts) == 3:
+            _, verdict, row_str = parts
+            try:
+                row_num = int(row_str)
+            except ValueError:
+                row_num = 4
+            qualified = (verdict == "yes")
+
+            # Запоминаем состояние ожидания причины
+            pending_reason[chat_id] = {"row": row_num, "qualified": qualified}
+
+            label = "✅ Квалифицированный" if qualified else "❌ Не квалифицированный"
+            send_message(chat_id, f"{label}\n\nНапишите причину:")
+            logger.info("Qual answer=%s row=%d from chat=%d, waiting for reason", verdict, row_num, chat_id)
+        else:
+            send_message(chat_id, "❌ Ошибка: неверный формат данных квалификации.")
 
     elif cb_data == "skip":
         send_message(chat_id, "Пропущено ❌")
