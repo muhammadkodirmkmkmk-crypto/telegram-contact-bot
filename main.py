@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 from datetime import datetime
@@ -167,12 +168,22 @@ def handle_message(msg):
     else:
         entities = msg.get("entities", [])
         phone = None
+        # Сначала ищем через Telegram entity (точное распознавание)
         for ent in entities:
             if ent.get("type") == "phone_number":
                 offset = ent["offset"]
                 length = ent["length"]
                 phone = text_body[offset:offset + length]
                 break
+        # Запасной вариант — regex для любых номеров (7-15 цифр, с +, пробелами, дефисами, скобками)
+        if not phone and text_body:
+            match = re.search(r'\+?[\d][\d\s\-\(\)]{5,17}[\d]', text_body)
+            if match:
+                # Оставляем только цифры и ведущий +
+                raw = match.group(0)
+                digits_only = re.sub(r'[\s\-\(\)]', '', raw)
+                if len(digits_only) >= 7:
+                    phone = digits_only
         if not phone:
             return
         name = sender_display
