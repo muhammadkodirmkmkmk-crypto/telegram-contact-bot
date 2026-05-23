@@ -240,11 +240,17 @@ def handle_callback(cb):
                     f"Квалифицированный?"
                 )
                 # callback_data: qual|yes|4 или qual|no|4  (row=4)
+                call_phone = phone if phone.startswith("+") else f"+{phone}"
                 qual_keyboard = {
-                    "inline_keyboard": [[
-                        {"text": "✅ Квалифицированный", "callback_data": "qual|yes|4"},
-                        {"text": "❌ Не квалифицированный", "callback_data": "qual|no|4"},
-                    ]]
+                    "inline_keyboard": [
+                        [
+                            {"text": "📞 Позвонить", "url": f"tel:{call_phone}"},
+                        ],
+                        [
+                            {"text": "✅ Квалифицированный", "callback_data": "qual|yes|4"},
+                            {"text": "❌ Не квалифицированный", "callback_data": "qual|no|4"},
+                        ],
+                    ]
                 }
                 for uid in QUALIFY_USER_IDS:
                     send_message(uid, qual_text, reply_markup=qual_keyboard)
