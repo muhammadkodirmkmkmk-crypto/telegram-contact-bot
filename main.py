@@ -232,9 +232,10 @@ def handle_callback(cb):
                 logger.info("Saved to sheet: %s %s %s", date_str, name, phone)
 
                 # Отправляем лид на квалификацию всем квалификаторам
+                call_phone = phone if phone.startswith("+") else f"+{phone}"
                 qual_text = (
                     f"📋 <b>Новый лид на квалификацию</b>\n"
-                    f"📞 Телефон: <code>{phone}</code>\n"
+                    f"📞 Телефон: {call_phone}\n"
                     f"👤 Имя: {name}\n"
                     f"📅 Дата: {date_str}\n\n"
                     f"Квалифицированный?"
