@@ -22,7 +22,7 @@ OWNER_ID = int(os.environ["OWNER_TELEGRAM_ID"])
 SHEETS_ID = os.environ["GOOGLE_SHEETS_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-QUALIFY_USER_ID = 514275093
+QUALIFY_USER_IDS = [514275093, 5028786313]
 
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -231,7 +231,7 @@ def handle_callback(cb):
                 send_message(chat_id, f"✅ Записано в таблицу!\n📞 {phone} — {name}")
                 logger.info("Saved to sheet: %s %s %s", date_str, name, phone)
 
-                # Отправляем лид на квалификацию пользователю 514275093
+                # Отправляем лид на квалификацию всем квалификаторам
                 qual_text = (
                     f"📋 <b>Новый лид на квалификацию</b>\n"
                     f"📞 Телефон: <code>{phone}</code>\n"
@@ -246,8 +246,9 @@ def handle_callback(cb):
                         {"text": "❌ Не квалифицированный", "callback_data": "qual|no|4"},
                     ]]
                 }
-                send_message(QUALIFY_USER_ID, qual_text, reply_markup=qual_keyboard)
-                logger.info("Qual message sent to %d for phone=%s", QUALIFY_USER_ID, phone)
+                for uid in QUALIFY_USER_IDS:
+                    send_message(uid, qual_text, reply_markup=qual_keyboard)
+                    logger.info("Qual message sent to %d for phone=%s", uid, phone)
 
             except Exception as exc:
                 logger.error("Failed to insert row: %s", exc)
