@@ -26,6 +26,7 @@ SHEETS_ID = os.environ["GOOGLE_SHEETS_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 QUALIFY_USER_IDS = [514275093, 5028786313]
+NOTIFY_GROUP_ID = -1005160536788
 
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -179,6 +180,62 @@ def update_reason_in_sheet(row_num, reason):
 
     sheets_call(_update)
     logger.info("[Sheets] UPDATE complete ✓")
+
+
+# ─── Multi-line lead parser ───────────────────────────────────────────────────
+
+def parse_lead_text(text_body, entities):
+    """
+    Parse phone and name from a multi-line message like:
+        restoran
+        ha
+        Nazokat Latipova
+        +998903080953
+    Returns (phone, name) or (None, None).
+    """
+    lines = [l.strip() for l in text_body.split('\n') if l.strip()]
+
+    # 1. Try Telegram entity first (most reliable)
+    phone = None
+    for ent in entities:
+        if ent.get("type") == "phone_number":
+            phone = text_body[ent["offset"]: ent["offset"] + ent["length"]]
+            break
+
+    # 2. Find phone line index via regex (works for any format)
+    phone_line_idx = None
+    for i, line in enumerate(lines):
+        match = re.search(r'\+?[\d][\d\s\-\(\)]{5,17}[\d]', line)
+        if match:
+            raw = match.group(0)
+            digits_only = re.sub(r'[\s\-\(\)]', '', raw)
+            if len(digits_only) >= 7:
+                if not phone:
+                    phone = digits_only
+                phone_line_idx = i
+                break
+
+    if not phone:
+        return None, None
+
+    # 3. Name = line just before the phone line (if it contains letters)
+    name = None
+    if phone_line_idx is not None and phone_line_idx > 0:
+        candidate = lines[phone_line_idx - 1]
+        if re.search(r'[a-zA-Zа-яА-ЯёЁ]', candidate):
+            name = candidate
+
+    # 4. Fallback: first line with 2+ words that looks like a name
+    if not name:
+        for line in lines:
+            if line == phone or not re.search(r'[a-zA-Zа-яА-ЯёЁ]', line):
+                continue
+            words = line.split()
+            if len(words) >= 2:
+                name = line
+                break
+
+    return phone, name
 
 
 # ─── Telegram helpers ─────────────────────────────────────────────────────────
@@ -361,22 +418,10 @@ def handle_message(msg):
         name = f"{first_name} {last_name}".strip() or sender_display
     else:
         entities = msg.get("entities", [])
-        phone = None
-        for ent in entities:
-            if ent.get("type") == "phone_number":
-                offset, length = ent["offset"], ent["length"]
-                phone = text_body[offset:offset + length]
-                break
-        if not phone and text_body:
-            match = re.search(r'\+?[\d][\d\s\-\(\)]{5,17}[\d]', text_body)
-            if match:
-                raw = match.group(0)
-                digits_only = re.sub(r'[\s\-\(\)]', '', raw)
-                if len(digits_only) >= 7:
-                    phone = digits_only
+        phone, parsed_name = parse_lead_text(text_body, entities)
         if not phone:
             return
-        name = sender_display
+        name = parsed_name or sender_display
 
     text = (
         f"📥 <b>Новый контакт</b>\n"
@@ -441,6 +486,20 @@ def handle_callback(cb):
                 for uid in QUALIFY_USER_IDS:
                     send_message(uid, qual_text, reply_markup=qual_keyboard)
                     logger.info("Qual message → %d for lead_id=%d", uid, lead_id)
+
+                # Уведомление в группу
+                try:
+                    group_text = (
+                        f"📥 <b>Новый лид</b>\n"
+                        f"📞 Телефон: {call_phone}\n"
+                        f"👤 Имя: {name}\n"
+                        f"📅 Дата: {date_str}\n\n"
+                        f"Абдулла ака лид пришел и сейчас отправлен продажникам !"
+                    )
+                    send_message(NOTIFY_GROUP_ID, group_text)
+                    logger.info("Group notification sent for lead_id=%d", lead_id)
+                except Exception as grp_exc:
+                    logger.error("Failed to notify group: %s", grp_exc)
 
             except Exception as exc:
                 logger.error("Failed to insert row: %s", exc)
