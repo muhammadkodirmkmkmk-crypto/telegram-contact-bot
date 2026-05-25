@@ -26,7 +26,7 @@ SHEETS_ID = os.environ["GOOGLE_SHEETS_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 QUALIFY_USER_IDS = [514275093, 5028786313]
-NOTIFY_GROUP_ID = -1005160536788
+NOTIFY_GROUP_ID = -5160536788
 
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
