@@ -34,7 +34,8 @@ REMINDER_INTERVAL_MIN   = 30
 DATA_START_ROW          = 4   # first data row in the sheet (1-indexed)
 
 # chat_id -> {'lead_id': str, 'qualified': bool}
-pending_reason: dict = {}
+pending_reason:  dict = {}   # chat_id → {lead_id, qualified, user_label}
+pending_followup: dict = {}  # chat_id → {lead_id, round, user_label}
 
 
 # ─── Google Sheets helpers ────────────────────────────────────────────────────
@@ -151,18 +152,60 @@ def sheet_update_status(sheet_row, status):
     sheets_call(_do)
 
 
-def sheet_mark_processed(sheet_row, reason):
-    """Write reason to col E and set status to DONE in col F."""
-    sheets = get_sheets()
+def sheet_mark_processed(sheet_row, reason, qualified=False):
+    """Write reason to col E and set status to DONE (or QUALIFIED) in col F."""
+    iso_now = datetime.now().isoformat()
+    status  = f"QUALIFIED|{iso_now}|0" if qualified else "DONE"
+    sheets  = get_sheets()
     def _do():
         sheets.values().update(
             spreadsheetId=SHEETS_ID,
             range=f"E{sheet_row}:F{sheet_row}",
             valueInputOption="USER_ENTERED",
-            body={"values": [[reason, "DONE"]]},
+            body={"values": [[reason, status]]},
         ).execute()
-        logger.info("[Sheets] Processed E%d:F%d ✓", sheet_row, sheet_row)
+        logger.info("[Sheets] Processed E%d:F%d status=%s ✓", sheet_row, sheet_row, status)
     sheets_call(_do)
+
+
+def sheet_advance_followup(sheet_row, new_round):
+    """Bump the followup counter in col F for a QUALIFIED lead."""
+    # Keep the original timestamp, just update the round number
+    lead_row = None
+    for lead in sheet_read_all():
+        if lead["sheet_row"] == sheet_row:
+            lead_row = lead
+            break
+    if lead_row:
+        parts = lead_row["status"].split("|")
+        ts = parts[1] if len(parts) > 1 else datetime.now().isoformat()
+    else:
+        ts = datetime.now().isoformat()
+    new_status = f"QUALIFIED|{ts}|{new_round}"
+    sheet_update_status(sheet_row, new_status)
+
+
+def sheet_get_qualified_for_3day_followup():
+    """Return QUALIFIED leads where round==1 and 3+ days have passed."""
+    result = []
+    for lead in sheet_read_all():
+        if not lead["status"].startswith("QUALIFIED|"):
+            continue
+        parts = lead["status"].split("|")
+        if len(parts) < 3:
+            continue
+        try:
+            ts    = datetime.fromisoformat(parts[1])
+            round_ = int(parts[2])
+        except (ValueError, IndexError):
+            continue
+        if round_ == 1:
+            elapsed_days = (datetime.now() - ts).total_seconds() / 86400
+            if elapsed_days >= 3:
+                lead["followup_ts"]    = parts[1]
+                lead["followup_round"] = round_
+                result.append(lead)
+    return result
 
 
 def sheet_get_pending():
@@ -422,6 +465,54 @@ def send_reminders():
             logger.error("[Reminder] Failed to update status: %s", exc)
 
 
+# ─── 3-day follow-up scheduler ───────────────────────────────────────────────
+
+def send_3day_followups():
+    logger.info("[FollowUp3day] Checking for leads needing 3-day follow-up...")
+    try:
+        leads = sheet_get_qualified_for_3day_followup()
+    except Exception as exc:
+        logger.error("[FollowUp3day] Sheet read failed: %s", exc)
+        return
+
+    if not leads:
+        logger.info("[FollowUp3day] No leads ready")
+        return
+
+    for lead in leads:
+        lead_id    = lead["lead_id"]
+        call_phone = lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}"
+        e_phone    = html_lib.escape(call_phone)
+        e_name     = html_lib.escape(str(lead["name"]))
+
+        fu_text = (
+            f"📋 <b>3-дневный follow-up по лиду</b>\n\n"
+            f"🆔 ID: <code>{lead_id}</code>\n"
+            f"📞 Телефон: {e_phone}\n"
+            f"👤 Имя: {e_name}\n\n"
+            f"3 дня прошло. Что сейчас происходит с этим лидом? На каком он этапе?\n"
+            f"<i>Напишите ответ текстом</i>"
+        )
+
+        for uid in QUALIFY_USER_IDS:
+            try:
+                send_message(uid, fu_text)
+                pending_followup[uid] = {
+                    "lead_id":    lead_id,
+                    "round":      2,
+                    "user_label": str(uid),
+                }
+                logger.info("[FollowUp3day] Survey sent → uid=%d lead=%s", uid, lead_id)
+            except Exception as exc:
+                logger.error("[FollowUp3day] Failed → uid=%d: %s", uid, exc)
+
+        # Advance counter to 2 so we don't send again
+        try:
+            sheet_advance_followup(lead["sheet_row"], 2)
+        except Exception as exc:
+            logger.error("[FollowUp3day] advance failed for %s: %s", lead_id, exc)
+
+
 # ─── Processing report ────────────────────────────────────────────────────────
 
 def send_processing_report(lead, processed_by, qualified, reason, created_at_iso):
@@ -467,6 +558,29 @@ def send_processing_report(lead, processed_by, qualified, reason, created_at_iso
         send_message(NOTIFY_GROUP_ID, group_result)
         logger.info("[Report] Sent to group for lead %s", lead["lead_id"])
 
+        # ── Immediate follow-up for qualified leads ───────────────────────────
+        if qualified:
+            lead_id   = lead["lead_id"]
+            fu_text   = (
+                f"📋 <b>Первый follow-up по лиду</b>\n\n"
+                f"🆔 ID: <code>{lead_id}</code>\n"
+                f"📞 Телефон: {e_phone}\n"
+                f"👤 Имя: {e_name}\n\n"
+                f"Что с ним случилось? На каком он сейчас этапе?\n"
+                f"<i>Напишите ответ текстом</i>"
+            )
+            for uid in QUALIFY_USER_IDS:
+                try:
+                    send_message(uid, fu_text)
+                    pending_followup[uid] = {
+                        "lead_id":    lead_id,
+                        "round":      1,
+                        "user_label": str(processed_by),
+                    }
+                    logger.info("[FollowUp] Immediate survey → uid=%d lead=%s", uid, lead_id)
+                except Exception as fu_exc:
+                    logger.error("[FollowUp] Failed to send to %d: %s", uid, fu_exc)
+
     except Exception as exc:
         logger.error("[Report] Failed: %s", exc)
 
@@ -501,6 +615,68 @@ def handle_message(msg):
     chat_id   = msg.get("chat", {}).get("id") or sender.get("id")
     text_body = msg.get("text", "") or msg.get("caption", "")
 
+    # ── Waiting for follow-up stage text ─────────────────────────────────────
+    if chat_id in pending_followup and text_body:
+        state      = pending_followup.pop(chat_id)
+        lead_id    = state["lead_id"]
+        followup_round = state["round"]        # 1 = immediate, 2 = 3-day
+        user_label = state.get("user_label", str(chat_id))
+        stage_text = text_body.strip()
+
+        lead = sheet_find_lead(lead_id)
+        if not lead:
+            send_message(chat_id, "❌ Лид не найден в таблице.")
+            return
+
+        e_phone    = html_lib.escape(lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}")
+        e_name     = html_lib.escape(str(lead["name"]))
+        e_stage    = html_lib.escape(stage_text)
+        e_by       = html_lib.escape(user_label)
+        e_reason   = html_lib.escape(str(lead.get("reason", "")))
+
+        send_message(chat_id, f"✅ Ответ сохранён!\n<i>{e_stage}</i>")
+
+        if followup_round == 1:
+            # First follow-up done → advance counter to 1 so 3-day job can find it
+            try:
+                sheet_advance_followup(lead["sheet_row"], 1)
+            except Exception as exc:
+                logger.error("[FollowUp1] advance failed: %s", exc)
+            # Notify owner about first stage report
+            send_message(
+                OWNER_ID,
+                f"📊 <b>Отчёт по этапу лида (1-й)</b>\n\n"
+                f"🆔 ID: <code>{lead_id}</code>\n"
+                f"📞 Телефон: {e_phone}\n"
+                f"👤 Имя: {e_name}\n"
+                f"📋 Этап: {e_stage}\n"
+                f"👤 Ответил: <b>{e_by}</b>"
+            )
+        else:
+            # Second follow-up done → send group report, mark FOLLOWUP_DONE
+            try:
+                sheet_update_status(lead["sheet_row"], "FOLLOWUP_DONE")
+            except Exception as exc:
+                logger.error("[FollowUp2] status update failed: %s", exc)
+            send_message(
+                NOTIFY_GROUP_ID,
+                f"📋 Абдулла ака лид в состоянии <b>{e_stage}</b>\n"
+                f"причина: {e_reason}\n"
+                f"кто обработал: <b>{e_by}</b>"
+            )
+            send_message(
+                OWNER_ID,
+                f"📊 <b>Финальный отчёт по лиду</b>\n\n"
+                f"🆔 ID: <code>{lead_id}</code>\n"
+                f"📞 Телефон: {e_phone}\n"
+                f"👤 Имя: {e_name}\n"
+                f"📋 Состояние: {e_stage}\n"
+                f"💬 Причина: {e_reason}\n"
+                f"👤 Кто обработал: <b>{e_by}</b>"
+            )
+        logger.info("[FollowUp] round=%d lead=%s by=%s", followup_round, lead_id, user_label)
+        return
+
     # ── Waiting for qualifier's reason text ──────────────────────────────────
     if chat_id in pending_reason and text_body:
         state      = pending_reason.pop(chat_id)
@@ -523,7 +699,7 @@ def handle_message(msg):
         full_reason = f"{label} | {user_label}: {reason}"
 
         try:
-            sheet_mark_processed(lead["sheet_row"], full_reason)
+            sheet_mark_processed(lead["sheet_row"], full_reason, qualified=qualified)
             send_message(chat_id, f"✅ Причина сохранена!\n<i>{html_lib.escape(full_reason)}</i>")
             logger.info("[Lead] Processed %s by %s qualified=%s", lead_id, user_label, qualified)
 
@@ -782,9 +958,11 @@ if __name__ == "__main__":
     set_webhook()
 
     scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(send_reminders, "interval", minutes=REMINDER_INTERVAL_MIN, id="reminders")
+    scheduler.add_job(send_reminders,        "interval", minutes=REMINDER_INTERVAL_MIN, id="reminders")
+    scheduler.add_job(send_3day_followups,   "interval", hours=6,                       id="followup_3day")
     scheduler.start()
     logger.info("[Scheduler] Reminders started (every %d min)", REMINDER_INTERVAL_MIN)
+    logger.info("[Scheduler] 3-day follow-up checker started (every 6h)")
 
     port = int(os.environ.get("PORT", 18609))
     logger.info("Starting Flask on port %d", port)
