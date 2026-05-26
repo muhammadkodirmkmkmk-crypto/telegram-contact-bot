@@ -615,69 +615,7 @@ def handle_message(msg):
     chat_id   = msg.get("chat", {}).get("id") or sender.get("id")
     text_body = msg.get("text", "") or msg.get("caption", "")
 
-    # ── Waiting for follow-up stage text ─────────────────────────────────────
-    if chat_id in pending_followup and text_body:
-        state      = pending_followup.pop(chat_id)
-        lead_id    = state["lead_id"]
-        followup_round = state["round"]        # 1 = immediate, 2 = 3-day
-        user_label = state.get("user_label", str(chat_id))
-        stage_text = text_body.strip()
-
-        lead = sheet_find_lead(lead_id)
-        if not lead:
-            send_message(chat_id, "❌ Лид не найден в таблице.")
-            return
-
-        e_phone    = html_lib.escape(lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}")
-        e_name     = html_lib.escape(str(lead["name"]))
-        e_stage    = html_lib.escape(stage_text)
-        e_by       = html_lib.escape(user_label)
-        e_reason   = html_lib.escape(str(lead.get("reason", "")))
-
-        send_message(chat_id, f"✅ Ответ сохранён!\n<i>{e_stage}</i>")
-
-        if followup_round == 1:
-            # First follow-up done → advance counter to 1 so 3-day job can find it
-            try:
-                sheet_advance_followup(lead["sheet_row"], 1)
-            except Exception as exc:
-                logger.error("[FollowUp1] advance failed: %s", exc)
-            # Notify owner about first stage report
-            send_message(
-                OWNER_ID,
-                f"📊 <b>Отчёт по этапу лида (1-й)</b>\n\n"
-                f"🆔 ID: <code>{lead_id}</code>\n"
-                f"📞 Телефон: {e_phone}\n"
-                f"👤 Имя: {e_name}\n"
-                f"📋 Этап: {e_stage}\n"
-                f"👤 Ответил: <b>{e_by}</b>"
-            )
-        else:
-            # Second follow-up done → send group report, mark FOLLOWUP_DONE
-            try:
-                sheet_update_status(lead["sheet_row"], "FOLLOWUP_DONE")
-            except Exception as exc:
-                logger.error("[FollowUp2] status update failed: %s", exc)
-            send_message(
-                NOTIFY_GROUP_ID,
-                f"📋 Абдулла ака лид в состоянии <b>{e_stage}</b>\n"
-                f"причина: {e_reason}\n"
-                f"кто обработал: <b>{e_by}</b>"
-            )
-            send_message(
-                OWNER_ID,
-                f"📊 <b>Финальный отчёт по лиду</b>\n\n"
-                f"🆔 ID: <code>{lead_id}</code>\n"
-                f"📞 Телефон: {e_phone}\n"
-                f"👤 Имя: {e_name}\n"
-                f"📋 Состояние: {e_stage}\n"
-                f"💬 Причина: {e_reason}\n"
-                f"👤 Кто обработал: <b>{e_by}</b>"
-            )
-        logger.info("[FollowUp] round=%d lead=%s by=%s", followup_round, lead_id, user_label)
-        return
-
-    # ── Waiting for qualifier's reason text ──────────────────────────────────
+    # ── Waiting for qualifier's reason text (checked FIRST — highest priority) ──
     if chat_id in pending_reason and text_body:
         state      = pending_reason.pop(chat_id)
         lead_id    = state["lead_id"]
@@ -710,6 +648,65 @@ def handle_message(msg):
         except Exception as exc:
             logger.error("Failed to process lead: %s", exc)
             send_message(chat_id, f"❌ Ошибка: {exc}")
+        return
+
+    # ── Waiting for follow-up stage text (checked AFTER pending_reason) ───────
+    if chat_id in pending_followup and text_body:
+        state          = pending_followup.pop(chat_id)
+        lead_id        = state["lead_id"]
+        followup_round = state["round"]
+        user_label     = state.get("user_label", str(chat_id))
+        stage_text     = text_body.strip()
+
+        lead = sheet_find_lead(lead_id)
+        if not lead:
+            send_message(chat_id, "❌ Лид не найден в таблице.")
+            return
+
+        e_phone  = html_lib.escape(lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}")
+        e_name   = html_lib.escape(str(lead["name"]))
+        e_stage  = html_lib.escape(stage_text)
+        e_by     = html_lib.escape(user_label)
+        e_reason = html_lib.escape(str(lead.get("reason", "")))
+
+        send_message(chat_id, f"✅ Ответ сохранён!\n<i>{e_stage}</i>")
+
+        if followup_round == 1:
+            try:
+                sheet_advance_followup(lead["sheet_row"], 1)
+            except Exception as exc:
+                logger.error("[FollowUp1] advance failed: %s", exc)
+            send_message(
+                OWNER_ID,
+                f"📊 <b>Отчёт по этапу лида (1-й)</b>\n\n"
+                f"🆔 ID: <code>{lead_id}</code>\n"
+                f"📞 Телефон: {e_phone}\n"
+                f"👤 Имя: {e_name}\n"
+                f"📋 Этап: {e_stage}\n"
+                f"👤 Ответил: <b>{e_by}</b>"
+            )
+        else:
+            try:
+                sheet_update_status(lead["sheet_row"], "FOLLOWUP_DONE")
+            except Exception as exc:
+                logger.error("[FollowUp2] status update failed: %s", exc)
+            send_message(
+                NOTIFY_GROUP_ID,
+                f"📋 Абдулла ака лид в состоянии <b>{e_stage}</b>\n"
+                f"причина: {e_reason}\n"
+                f"кто обработал: <b>{e_by}</b>"
+            )
+            send_message(
+                OWNER_ID,
+                f"📊 <b>Финальный отчёт по лиду</b>\n\n"
+                f"🆔 ID: <code>{lead_id}</code>\n"
+                f"📞 Телефон: {e_phone}\n"
+                f"👤 Имя: {e_name}\n"
+                f"📋 Состояние: {e_stage}\n"
+                f"💬 Причина: {e_reason}\n"
+                f"👤 Кто обработал: <b>{e_by}</b>"
+            )
+        logger.info("[FollowUp] round=%d lead=%s by=%s", followup_round, lead_id, user_label)
         return
 
     # ── Regular contact detection ────────────────────────────────────────────
@@ -919,6 +916,9 @@ def handle_callback(cb):
         lname      = from_user.get("last_name", "")
         user_label = (f"@{uname}" if uname else
                       f"{fname} {lname}".strip() or str(chat_id))
+
+        # Clear any stale follow-up state so qual reason is not swallowed by it
+        pending_followup.pop(chat_id, None)
 
         pending_reason[chat_id] = {
             "lead_id":    lead_id,
