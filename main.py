@@ -188,54 +188,115 @@ def sheet_get_pending():
 
 # ─── Multi-line lead parser ───────────────────────────────────────────────────
 
+# Matches phone numbers in many formats:
+#   +998 90 123 45 67 / 998901234567 / +7(999)123-45-67 / 8 800 123 45 67
+PHONE_RE = re.compile(r'(?<!\d)(\+?[1-9][\d\s\-\.\(\)]{5,20}[\d])(?!\d)')
+
+# Labels that precede phone/name values in structured bot messages
+PHONE_LABEL_RE = re.compile(
+    r'^(?:телефон|тел|phone|tel|моб|mob|номер|number|kontakt|contact)\s*[:\-]?\s*',
+    re.IGNORECASE
+)
+NAME_LABEL_RE = re.compile(
+    r'^(?:имя|name|клиент|client|ф\.?и\.?о\.?|фио|контакт|заявка от|от|from)\s*[:\-]?\s*',
+    re.IGNORECASE
+)
+
+
+def extract_phone(raw: str) -> str | None:
+    """Normalise a raw phone match — return cleaned string or None if too short."""
+    cleaned = re.sub(r'[\s\-\.\(\)]', '', raw)
+    # must have at least 7 digits (ignore country-code prefix)
+    if len(re.sub(r'\D', '', cleaned)) >= 7:
+        return cleaned
+    return None
+
+
 def parse_lead_text(text_body, entities):
     """
-    Parse phone and name from a multi-line message like:
-        restoran
-        ha
-        Nazokat Latipova
-        +998903080953
+    Extracts (phone, name) from any free-form or structured message, e.g.:
+
+    Free-form multi-line:          Structured (bot format):
+        restoran                       Имя: Nazokat Latipova
+        Nazokat Latipova               Телефон: +998 90 308 09 53
+        +998 90 308 09 53
+
+    Single line:                   Inline with label:
+        +998903080953                  Тел: +998903080953 — Nazokat
+
     Returns (phone, name) or (None, None).
     """
+    if not text_body:
+        return None, None
+
     lines = [l.strip() for l in text_body.split('\n') if l.strip()]
 
-    # 1. Try Telegram entity first
+    # ── 1. Telegram entity (most reliable) ───────────────────────────────────
     phone = None
-    for ent in entities:
+    for ent in (entities or []):
         if ent.get("type") == "phone_number":
             phone = text_body[ent["offset"]: ent["offset"] + ent["length"]]
             break
 
-    # 2. Find phone line index via regex
+    # ── 2. Structured "Label: value" scan ────────────────────────────────────
+    structured_name  = None
+    structured_phone = None
+    for line in lines:
+        if PHONE_LABEL_RE.match(line):
+            val = PHONE_LABEL_RE.sub('', line).strip()
+            m = PHONE_RE.search(val)
+            if m:
+                structured_phone = extract_phone(m.group(0))
+        elif NAME_LABEL_RE.match(line):
+            val = NAME_LABEL_RE.sub('', line).strip()
+            if val and re.search(r'[a-zA-Zа-яА-ЯёЁ\u0400-\u04FF\u00C0-\u024F]', val):
+                structured_name = val
+
+    if structured_phone:
+        return structured_phone, structured_name
+
+    # ── 3. Free-form: find first line that contains a phone number ───────────
     phone_line_idx = None
     for i, line in enumerate(lines):
-        match = re.search(r'\+?[\d][\d\s\-\(\)]{5,17}[\d]', line)
-        if match:
-            raw        = match.group(0)
-            digits_only = re.sub(r'[\s\-\(\)]', '', raw)
-            if len(digits_only) >= 7:
+        m = PHONE_RE.search(line)
+        if m:
+            candidate = extract_phone(m.group(0))
+            if candidate:
                 if not phone:
-                    phone = digits_only
+                    phone = candidate
                 phone_line_idx = i
                 break
 
     if not phone:
         return None, None
 
-    # 3. Name = line just before the phone line
+    # ── 4. Name = line directly before the phone line ────────────────────────
     name = None
     if phone_line_idx is not None and phone_line_idx > 0:
         candidate = lines[phone_line_idx - 1]
-        if re.search(r'[a-zA-Zа-яА-ЯёЁ]', candidate):
+        candidate = NAME_LABEL_RE.sub('', candidate).strip()
+        if re.search(r'[a-zA-Zа-яА-ЯёЁ\u0400-\u04FF\u00C0-\u024F]', candidate):
             name = candidate
 
-    # 4. Fallback: first line with 2+ words that looks like a name
+    # ── 5. Name = line directly after the phone line ─────────────────────────
+    if not name and phone_line_idx is not None:
+        for j in range(phone_line_idx + 1, min(phone_line_idx + 3, len(lines))):
+            candidate = NAME_LABEL_RE.sub('', lines[j]).strip()
+            if re.search(r'[a-zA-Zа-яА-ЯёЁ\u0400-\u04FF\u00C0-\u024F]', candidate):
+                name = candidate
+                break
+
+    # ── 6. Fallback: first line with 2+ words that looks like a name ─────────
     if not name:
         for line in lines:
-            if line == phone or not re.search(r'[a-zA-Zа-яА-ЯёЁ]', line):
+            cleaned = NAME_LABEL_RE.sub('', line).strip()
+            if not cleaned or not re.search(r'[a-zA-Zа-яА-ЯёЁ\u0400-\u04FF\u00C0-\u024F]', cleaned):
                 continue
-            if len(line.split()) >= 2:
-                name = line
+            # skip if this line IS the phone itself or a short keyword
+            if PHONE_RE.search(cleaned) and len(re.sub(r'\D', '', cleaned)) >= 7:
+                continue
+            if len(cleaned.split()) >= 2:
+                name = cleaned
                 break
 
     return phone, name
