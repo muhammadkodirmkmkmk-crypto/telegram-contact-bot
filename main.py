@@ -25,7 +25,7 @@ OWNER_ID                = int(os.environ["OWNER_TELEGRAM_ID"])
 SHEETS_ID               = os.environ["GOOGLE_SHEETS_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-QUALIFY_USER_IDS        = [514275093, 5028786313]
+QUALIFY_USER_IDS        = list({514275093, 5028786313, OWNER_ID})
 NOTIFY_GROUP_ID         = -5160536788
 
 API_BASE                = f"https://api.telegram.org/bot{BOT_TOKEN}"
