@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import html as html_lib
 import logging
 import time
 from datetime import datetime
@@ -351,8 +352,8 @@ def send_reminders():
         text = (
             f"⏰ <b>Напоминание #{n} — необработанный лид!</b>\n\n"
             f"🆔 ID: <code>{lead_id}</code>\n"
-            f"📞 Телефон: {call_phone}\n"
-            f"👤 Имя: {lead['name']}\n"
+            f"📞 Телефон: {html_lib.escape(call_phone)}\n"
+            f"👤 Имя: {html_lib.escape(str(lead['name']))}\n"
             f"📅 Дата: {lead['date_str']}\n"
             f"🕐 Ожидает: {lead['elapsed_min']} мин.\n"
             f"🔁 Напоминаний: {lead['reminder_count']}\n\n"
@@ -394,14 +395,14 @@ def send_processing_report(lead, processed_by, qualified, reason, created_at_iso
         report = (
             f"📊 <b>Отчёт по обработке лида</b>\n\n"
             f"🆔 ID: <code>{lead['lead_id']}</code>\n"
-            f"📞 Телефон: {call_phone}\n"
-            f"👤 Имя: {lead['name']}\n"
+            f"📞 Телефон: {html_lib.escape(call_phone)}\n"
+            f"👤 Имя: {html_lib.escape(str(lead['name']))}\n"
             f"📅 Дата: {lead['date_str']}\n\n"
             f"⏱ Время обработки: {hours}ч {mins}мин\n"
             f"👤 Обработал: <code>{processed_by}</code>\n"
             f"🔁 Напоминаний: {reminder_count}\n"
             f"📋 Статус: {qual_label}\n"
-            f"💬 Причина: {reason}"
+            f"💬 Причина: {html_lib.escape(str(reason))}"
         )
         send_message(OWNER_ID, report)
         logger.info("[Report] Sent for lead %s", lead["lead_id"])
@@ -489,11 +490,14 @@ def handle_message(msg):
             return
         name = parsed_name or sender_display
 
+    e_phone  = html_lib.escape(str(phone))
+    e_name   = html_lib.escape(str(name))
+    e_sender = html_lib.escape(str(sender_display))
     text = (
         f"📥 <b>Новый контакт</b>\n"
-        f"📞 Телефон: <code>{phone}</code>\n"
-        f"👤 Имя: {name}\n"
-        f"👤 Кто скинул: {sender_display}\n"
+        f"📞 Телефон: <code>{e_phone}</code>\n"
+        f"👤 Имя: {e_name}\n"
+        f"👤 Кто скинул: {e_sender}\n"
         f"📅 Дата: {date_str}"
     )
 
@@ -532,18 +536,21 @@ def handle_callback(cb):
 
         try:
             sheet_insert_lead(lead_id, date_str, name, phone)
+            e_phone2 = html_lib.escape(str(phone))
+            e_name2  = html_lib.escape(str(name))
             send_message(
                 chat_id,
-                f"✅ Записано!\n📞 {phone} — {name}\n🆔 ID: <code>{lead_id}</code>"
+                f"✅ Записано!\n📞 {e_phone2} — {e_name2}\n🆔 ID: <code>{lead_id}</code>"
             )
             logger.info("Saved lead_id=%s phone=%s name=%s", lead_id, phone, name)
 
             call_phone = phone if phone.startswith("+") else f"+{phone}"
+            e_call     = html_lib.escape(str(call_phone))
             qual_text  = (
                 f"📋 <b>Новый лид на квалификацию</b>\n"
                 f"🆔 ID: <code>{lead_id}</code>\n"
-                f"📞 Телефон: {call_phone}\n"
-                f"👤 Имя: {name}\n"
+                f"📞 Телефон: {e_call}\n"
+                f"👤 Имя: {e_name2}\n"
                 f"📅 Дата: {date_str}\n\n"
                 f"Квалифицированный?"
             )
@@ -571,8 +578,8 @@ def handle_callback(cb):
             try:
                 group_text = (
                     f"📥 <b>Новый лид</b>\n"
-                    f"📞 Телефон: {call_phone}\n"
-                    f"👤 Имя: {name}\n"
+                    f"📞 Телефон: {e_call}\n"
+                    f"👤 Имя: {e_name2}\n"
                     f"📅 Дата: {date_str}\n\n"
                     f"Абдулла ака лид пришел и сейчас отправлен продажникам !"
                 )
