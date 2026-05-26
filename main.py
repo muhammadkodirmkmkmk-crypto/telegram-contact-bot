@@ -372,7 +372,7 @@ def webhook():
 def handle_message(msg):
     sender    = msg.get("from", {})
     chat_id   = msg.get("chat", {}).get("id") or sender.get("id")
-    text_body = msg.get("text", "")
+    text_body = msg.get("text", "") or msg.get("caption", "")
 
     # ── Waiting for qualifier's reason text ──────────────────────────────────
     if chat_id in pending_reason and text_body:
@@ -422,7 +422,7 @@ def handle_message(msg):
         last_name  = contact.get("last_name", "")
         name       = f"{first_name} {last_name}".strip() or sender_display
     else:
-        entities     = msg.get("entities", [])
+        entities     = msg.get("entities", []) or msg.get("caption_entities", [])
         phone, parsed_name = parse_lead_text(text_body, entities)
         if not phone:
             return
@@ -491,9 +491,20 @@ def handle_callback(cb):
                 {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
             ]]}
 
+            failed_qual_uids = []
             for uid in QUALIFY_USER_IDS:
-                send_message(uid, qual_text, reply_markup=qual_keyboard)
-                logger.info("Qual message → %d lead_id=%s", uid, lead_id)
+                try:
+                    send_message(uid, qual_text, reply_markup=qual_keyboard)
+                    logger.info("Qual message → %d lead_id=%s", uid, lead_id)
+                except Exception as q_exc:
+                    logger.error("Failed to send qual to %d: %s", uid, q_exc)
+                    failed_qual_uids.append(uid)
+            if failed_qual_uids:
+                send_message(
+                    chat_id,
+                    f"⚠️ Не удалось отправить квалификаторам: {failed_qual_uids}\n"
+                    f"Проверьте, что они начали диалог с ботом."
+                )
 
             # Group notification
             try:
