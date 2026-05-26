@@ -305,25 +305,68 @@ def parse_lead_text(text_body, entities):
 
 # ─── Telegram helpers ─────────────────────────────────────────────────────────
 
+MAX_TEXT = 4096
+
+
 def send_message(chat_id, text, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    """
+    Send a Telegram message safely.
+    - Validates chat_id and text before sending.
+    - Truncates text to 4096 chars if needed.
+    - Logs errors and returns None instead of raising, so callers never crash.
+    """
+    if not chat_id:
+        logger.error("[TG] send_message skipped: chat_id is empty")
+        return None
+    if not text or not str(text).strip():
+        logger.error("[TG] send_message skipped: text is empty (chat_id=%s)", chat_id)
+        return None
+
+    safe_text = str(text)
+    if len(safe_text) > MAX_TEXT:
+        logger.warning("[TG] Text truncated from %d to %d chars", len(safe_text), MAX_TEXT)
+        safe_text = safe_text[:MAX_TEXT]
+
+    payload = {"chat_id": chat_id, "text": safe_text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
-    resp = requests.post(f"{API_BASE}/sendMessage", json=payload, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+
+    try:
+        resp = requests.post(f"{API_BASE}/sendMessage", json=payload, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.HTTPError as exc:
+        # Log full response body so we can see Telegram's error description
+        body = ""
+        try:
+            body = exc.response.text
+        except Exception:
+            pass
+        logger.error("[TG] sendMessage HTTP %s for chat_id=%s: %s | body: %s",
+                     exc.response.status_code if exc.response else "?",
+                     chat_id, exc, body)
+        return None
+    except Exception as exc:
+        logger.error("[TG] sendMessage failed for chat_id=%s: %s", chat_id, exc)
+        return None
 
 
 def answer_callback(cq_id, text=""):
-    requests.post(f"{API_BASE}/answerCallbackQuery",
-                  json={"callback_query_id": cq_id, "text": text}, timeout=10)
+    try:
+        requests.post(f"{API_BASE}/answerCallbackQuery",
+                      json={"callback_query_id": cq_id, "text": text}, timeout=10)
+    except Exception as exc:
+        logger.error("[TG] answerCallbackQuery failed: %s", exc)
 
 
 def edit_message_reply_markup(chat_id, message_id):
-    requests.post(f"{API_BASE}/editMessageReplyMarkup",
-                  json={"chat_id": chat_id, "message_id": message_id,
-                        "reply_markup": json.dumps({"inline_keyboard": []})},
-                  timeout=10)
+    try:
+        requests.post(f"{API_BASE}/editMessageReplyMarkup",
+                      json={"chat_id": chat_id, "message_id": message_id,
+                            "reply_markup": json.dumps({"inline_keyboard": []})},
+                      timeout=10)
+    except Exception as exc:
+        logger.error("[TG] editMessageReplyMarkup failed: %s", exc)
 
 
 # ─── Reminder scheduler ───────────────────────────────────────────────────────
@@ -417,17 +460,21 @@ def webhook():
     logger.info("POST /webhook received")
     try:
         data = request.get_json(force=True)
+        if not data:
+            logger.error("Empty JSON body")
+            return "ok", 200
+
+        logger.info("Update: %s", json.dumps(data, ensure_ascii=False)[:500])
+
+        if "callback_query" in data:
+            handle_callback(data["callback_query"])
+        elif "message" in data:
+            handle_message(data["message"])
+
     except Exception as exc:
-        logger.error("Failed to parse JSON: %s", exc)
-        abort(400)
+        logger.error("Unhandled error in webhook: %s", exc, exc_info=True)
 
-    logger.info("Update: %s", json.dumps(data, ensure_ascii=False))
-
-    if "callback_query" in data:
-        handle_callback(data["callback_query"])
-    elif "message" in data:
-        handle_message(data["message"])
-
+    # Always return 200 so Telegram does not retry the update
     return "ok", 200
 
 
@@ -457,7 +504,7 @@ def handle_message(msg):
 
         try:
             sheet_mark_processed(lead["sheet_row"], full_reason)
-            send_message(chat_id, f"✅ Причина сохранена!\n<i>{full_reason}</i>")
+            send_message(chat_id, f"✅ Причина сохранена!\n<i>{html_lib.escape(full_reason)}</i>")
             logger.info("[Lead] Processed %s by %d qualified=%s", lead_id, chat_id, qualified)
 
             # Parse created_at from status field
