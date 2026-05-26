@@ -560,6 +560,65 @@ def handle_message(msg):
     e_phone  = html_lib.escape(str(phone))
     e_name   = html_lib.escape(str(name))
     e_sender = html_lib.escape(str(sender_display))
+    is_bot_sender = sender.get("is_bot", False)
+
+    # ── Auto-save if message came from another bot ────────────────────────────
+    if is_bot_sender:
+        lead_id    = datetime.now().strftime("%Y%m%d%H%M%S")
+        call_phone = phone if phone.startswith("+") else f"+{phone}"
+        e_call     = html_lib.escape(call_phone)
+        e_name2    = html_lib.escape(str(name))
+
+        try:
+            sheet_insert_lead(lead_id, date_str, name, phone)
+            logger.info("[AutoSave] lead_id=%s phone=%s name=%s bot=%s",
+                        lead_id, phone, name, sender_display)
+
+            # Notify owner — no buttons needed
+            send_message(
+                OWNER_ID,
+                f"🤖 <b>Авто-сохранён контакт от бота</b>\n"
+                f"📞 Телефон: <code>{e_call}</code>\n"
+                f"👤 Имя: {e_name2}\n"
+                f"🤖 Бот: {e_sender}\n"
+                f"📅 Дата: {date_str}\n"
+                f"🆔 ID: <code>{lead_id}</code>"
+            )
+
+            # Send to qualifiers
+            qual_text = (
+                f"📋 <b>Новый лид на квалификацию</b> (авто)\n"
+                f"🆔 ID: <code>{lead_id}</code>\n"
+                f"📞 Телефон: {e_call}\n"
+                f"👤 Имя: {e_name2}\n"
+                f"📅 Дата: {date_str}\n\n"
+                f"Квалифицированный?"
+            )
+            qual_keyboard = {"inline_keyboard": [[
+                {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
+                {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
+            ]]}
+            for uid in QUALIFY_USER_IDS:
+                try:
+                    send_message(uid, qual_text, reply_markup=qual_keyboard)
+                except Exception as q_exc:
+                    logger.error("[AutoSave] qual send to %d failed: %s", uid, q_exc)
+
+            # Notify group
+            send_message(
+                NOTIFY_GROUP_ID,
+                f"📥 <b>Новый лид</b>\n"
+                f"📞 Телефон: {e_call}\n"
+                f"👤 Имя: {e_name2}\n"
+                f"📅 Дата: {date_str}\n\n"
+                f"Абдулла ака лид пришел и сейчас отправлен продажникам !"
+            )
+        except Exception as exc:
+            logger.error("[AutoSave] Failed: %s", exc)
+            send_message(OWNER_ID, f"❌ Авто-сохранение не удалось: {html_lib.escape(str(exc))}")
+        return
+
+    # ── Manual confirm for human senders ─────────────────────────────────────
     text = (
         f"📥 <b>Новый контакт</b>\n"
         f"📞 Телефон: <code>{e_phone}</code>\n"
