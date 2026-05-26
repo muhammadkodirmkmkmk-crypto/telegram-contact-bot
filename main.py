@@ -434,21 +434,39 @@ def send_processing_report(lead, processed_by, qualified, reason, created_at_iso
         call_phone     = lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}"
         reminder_count = lead.get("reminder_count", 0)
         qual_label     = "✅ Квалифицированный" if qualified else "❌ Не квалифицированный"
+        e_phone        = html_lib.escape(call_phone)
+        e_name         = html_lib.escape(str(lead["name"]))
+        e_by           = html_lib.escape(str(processed_by))
+        e_reason       = html_lib.escape(str(reason))
 
-        report = (
+        # ── Report to owner ──────────────────────────────────────────────────
+        owner_report = (
             f"📊 <b>Отчёт по обработке лида</b>\n\n"
             f"🆔 ID: <code>{lead['lead_id']}</code>\n"
-            f"📞 Телефон: {html_lib.escape(call_phone)}\n"
-            f"👤 Имя: {html_lib.escape(str(lead['name']))}\n"
+            f"📞 Телефон: {e_phone}\n"
+            f"👤 Имя клиента: {e_name}\n"
             f"📅 Дата: {lead['date_str']}\n\n"
             f"⏱ Время обработки: {hours}ч {mins}мин\n"
-            f"👤 Обработал: <code>{processed_by}</code>\n"
+            f"👤 Обработал: <b>{e_by}</b>\n"
             f"🔁 Напоминаний: {reminder_count}\n"
             f"📋 Статус: {qual_label}\n"
-            f"💬 Причина: {html_lib.escape(str(reason))}"
+            f"💬 Причина: {e_reason}"
         )
-        send_message(OWNER_ID, report)
-        logger.info("[Report] Sent for lead %s", lead["lead_id"])
+        send_message(OWNER_ID, owner_report)
+        logger.info("[Report] Sent to owner for lead %s", lead["lead_id"])
+
+        # ── Result to group ──────────────────────────────────────────────────
+        group_result = (
+            f"✅ <b>Лид обработан</b>\n\n"
+            f"📞 Телефон: {e_phone}\n"
+            f"👤 Имя: {e_name}\n"
+            f"📋 Статус: {qual_label}\n"
+            f"👤 Обработал: <b>{e_by}</b>\n"
+            f"💬 Причина: {e_reason}"
+        )
+        send_message(NOTIFY_GROUP_ID, group_result)
+        logger.info("[Report] Sent to group for lead %s", lead["lead_id"])
+
     except Exception as exc:
         logger.error("[Report] Failed: %s", exc)
 
@@ -485,10 +503,11 @@ def handle_message(msg):
 
     # ── Waiting for qualifier's reason text ──────────────────────────────────
     if chat_id in pending_reason and text_body:
-        state     = pending_reason.pop(chat_id)
-        lead_id   = state["lead_id"]
-        qualified = state["qualified"]
-        reason    = text_body.strip()
+        state      = pending_reason.pop(chat_id)
+        lead_id    = state["lead_id"]
+        qualified  = state["qualified"]
+        user_label = state.get("user_label", str(chat_id))
+        reason     = text_body.strip()
 
         lead = sheet_find_lead(lead_id)
         if not lead:
@@ -500,17 +519,18 @@ def handle_message(msg):
             return
 
         label       = "Квалифицированный ✅" if qualified else "Не квалифицированный ❌"
-        full_reason = f"{label}: {reason}"
+        # Записываем в таблицу: статус, кто обработал и причина
+        full_reason = f"{label} | {user_label}: {reason}"
 
         try:
             sheet_mark_processed(lead["sheet_row"], full_reason)
             send_message(chat_id, f"✅ Причина сохранена!\n<i>{html_lib.escape(full_reason)}</i>")
-            logger.info("[Lead] Processed %s by %d qualified=%s", lead_id, chat_id, qualified)
+            logger.info("[Lead] Processed %s by %s qualified=%s", lead_id, user_label, qualified)
 
             # Parse created_at from status field
             parts      = lead["status"].split("|")
             created_at = parts[1] if len(parts) > 1 else datetime.now().isoformat()
-            send_processing_report(lead, chat_id, qualified, full_reason, created_at)
+            send_processing_report(lead, user_label, qualified, full_reason, created_at)
         except Exception as exc:
             logger.error("Failed to process lead: %s", exc)
             send_message(chat_id, f"❌ Ошибка: {exc}")
@@ -657,12 +677,23 @@ def handle_callback(cb):
             send_message(chat_id, "ℹ️ Этот лид уже обработан другим квалификатором.")
             return
 
-        qualified = (verdict == "yes")
-        pending_reason[chat_id] = {"lead_id": lead_id, "qualified": qualified}
+        qualified  = (verdict == "yes")
+        from_user  = cb.get("from", {})
+        uname      = from_user.get("username")
+        fname      = from_user.get("first_name", "")
+        lname      = from_user.get("last_name", "")
+        user_label = (f"@{uname}" if uname else
+                      f"{fname} {lname}".strip() or str(chat_id))
+
+        pending_reason[chat_id] = {
+            "lead_id":    lead_id,
+            "qualified":  qualified,
+            "user_label": user_label,
+        }
 
         label = "✅ Квалифицированный" if qualified else "❌ Не квалифицированный"
         send_message(chat_id, f"{label}\n\nНапишите причину:")
-        logger.info("Qual answer=%s lead_id=%s from %d", verdict, lead_id, chat_id)
+        logger.info("Qual answer=%s lead_id=%s from %s", verdict, lead_id, user_label)
 
     # ── Skip ─────────────────────────────────────────────────────────────────
     elif cb_data == "skip":
