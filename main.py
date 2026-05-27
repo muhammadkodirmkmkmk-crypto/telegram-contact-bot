@@ -733,91 +733,65 @@ def handle_message(msg):
             return
         name = parsed_name or sender_display
 
-    e_phone  = html_lib.escape(str(phone))
-    e_name   = html_lib.escape(str(name))
     e_sender = html_lib.escape(str(sender_display))
-    is_bot_sender = sender.get("is_bot", False)
 
-    # ── Auto-save if message came from another bot ────────────────────────────
-    if is_bot_sender:
-        lead_id    = datetime.now().strftime("%Y%m%d%H%M%S")
-        call_phone = phone if phone.startswith("+") else f"+{phone}"
-        e_call     = html_lib.escape(call_phone)
-        e_name2    = html_lib.escape(str(name))
+    # ── Auto-save ALL contacts (human or bot) ─────────────────────────────────
+    lead_id    = datetime.now().strftime("%Y%m%d%H%M%S")
+    call_phone = phone if phone.startswith("+") else f"+{phone}"
+    e_call     = html_lib.escape(call_phone)
+    e_name2    = html_lib.escape(str(name))
 
-        try:
-            sheet_insert_lead(lead_id, date_str, name, phone)
-            logger.info("[AutoSave] lead_id=%s phone=%s name=%s bot=%s",
-                        lead_id, phone, name, sender_display)
+    try:
+        sheet_insert_lead(lead_id, date_str, name, phone)
+        logger.info("[AutoSave] lead_id=%s phone=%s name=%s sender=%s",
+                    lead_id, phone, name, sender_display)
 
-            # Notify owner — no buttons needed
-            send_message(
-                OWNER_ID,
-                f"🤖 <b>Авто-сохранён контакт от бота</b>\n"
-                f"📞 Телефон: <code>{e_call}</code>\n"
-                f"👤 Имя: {e_name2}\n"
-                f"🤖 Бот: {e_sender}\n"
-                f"📅 Дата: {date_str}\n"
-                f"🆔 ID: <code>{lead_id}</code>"
-            )
+        # Notify owner
+        send_message(
+            OWNER_ID,
+            f"📥 <b>Новый контакт сохранён</b>\n"
+            f"📞 Телефон: <code>{e_call}</code>\n"
+            f"👤 Имя: {e_name2}\n"
+            f"👤 Кто скинул: {e_sender}\n"
+            f"📅 Дата: {date_str}\n"
+            f"🆔 ID: <code>{lead_id}</code>"
+        )
 
-            # Send to qualifiers
-            qual_text = (
-                f"📋 <b>Новый лид на квалификацию</b> (авто)\n"
-                f"🆔 ID: <code>{lead_id}</code>\n"
-                f"📞 Телефон: {e_call}\n"
-                f"👤 Имя: {e_name2}\n"
-                f"📅 Дата: {date_str}\n\n"
-                f"Квалифицированный?"
-            )
-            qual_keyboard = {"inline_keyboard": [
-                [
-                    {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
-                    {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
-                ],
-                [{"text": "🔄 Уже работаю",            "callback_data": f"working|{lead_id}"}],
-            ]}
-            for uid in QUALIFY_USER_IDS:
-                try:
-                    send_message(uid, qual_text, reply_markup=qual_keyboard)
-                except Exception as q_exc:
-                    logger.error("[AutoSave] qual send to %d failed: %s", uid, q_exc)
+        # Send to qualifiers
+        qual_text = (
+            f"📋 <b>Новый лид на квалификацию</b>\n"
+            f"🆔 ID: <code>{lead_id}</code>\n"
+            f"📞 Телефон: {e_call}\n"
+            f"👤 Имя: {e_name2}\n"
+            f"👤 Кто скинул: {e_sender}\n"
+            f"📅 Дата: {date_str}\n\n"
+            f"Квалифицированный?"
+        )
+        qual_keyboard = {"inline_keyboard": [
+            [
+                {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
+                {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
+            ],
+            [{"text": "🔄 Уже работаю",            "callback_data": f"working|{lead_id}"}],
+        ]}
+        for uid in QUALIFY_USER_IDS:
+            try:
+                send_message(uid, qual_text, reply_markup=qual_keyboard)
+            except Exception as q_exc:
+                logger.error("[AutoSave] qual send to %d failed: %s", uid, q_exc)
 
-            # Notify group
-            send_message(
-                NOTIFY_GROUP_ID,
-                f"📥 <b>Новый лид</b>\n"
-                f"📞 Телефон: {e_call}\n"
-                f"👤 Имя: {e_name2}\n"
-                f"📅 Дата: {date_str}\n\n"
-                f"Абдулла ака лид пришел и сейчас отправлен продажникам !"
-            )
-        except Exception as exc:
-            logger.error("[AutoSave] Failed: %s", exc)
-            send_message(OWNER_ID, f"❌ Авто-сохранение не удалось: {html_lib.escape(str(exc))}")
-        return
-
-    # ── Manual confirm for human senders ─────────────────────────────────────
-    text = (
-        f"📥 <b>Новый контакт</b>\n"
-        f"📞 Телефон: <code>{e_phone}</code>\n"
-        f"👤 Имя: {e_name}\n"
-        f"👤 Кто скинул: {e_sender}\n"
-        f"📅 Дата: {date_str}"
-    )
-
-    fixed        = f"save|{date_str}||{phone}"
-    max_name_len = 64 - len(fixed.encode())
-    name_safe    = name[:max_name_len] if len(name.encode()) > max_name_len else name
-    cb_save      = f"save|{date_str}|{name_safe}|{phone}"
-
-    keyboard = {"inline_keyboard": [[
-        {"text": "✅ Записать",   "callback_data": cb_save},
-        {"text": "❌ Пропустить", "callback_data": "skip"},
-    ]]}
-
-    send_message(OWNER_ID, text, reply_markup=keyboard)
-    logger.info("Forwarded contact: phone=%s name=%s sender=%s", phone, name, sender_display)
+        # Notify group
+        send_message(
+            NOTIFY_GROUP_ID,
+            f"📥 <b>Новый лид</b>\n"
+            f"📞 Телефон: {e_call}\n"
+            f"👤 Имя: {e_name2}\n"
+            f"📅 Дата: {date_str}\n\n"
+            f"Абдулла ака лид пришел и сейчас отправлен продажникам !"
+        )
+    except Exception as exc:
+        logger.error("[AutoSave] Failed: %s", exc)
+        send_message(OWNER_ID, f"❌ Авто-сохранение не удалось: {html_lib.escape(str(exc))}")
 
 
 def handle_callback(cb):
@@ -959,8 +933,6 @@ def handle_callback(cb):
         e_name  = html_lib.escape(str(lead["name"]) if lead else "?")
         e_by    = html_lib.escape(user_label)
 
-        send_message(chat_id, f"✅ Отлично! Ты отметил что уже работаешь с этим лидом.")
-
         notify_text = (
             f"🔄 <b>Лид уже в работе!</b>\n\n"
             f"🆔 ID: <code>{lead_id}</code>\n"
@@ -968,14 +940,22 @@ def handle_callback(cb):
             f"👤 Имя: {e_name}\n\n"
             f"👤 Работает: <b>{e_by}</b>"
         )
-        # Notify all other qualifiers and owner
+        # Notify ALL qualifiers (including the one who clicked) + owner
         notified = set()
         for uid in QUALIFY_USER_IDS:
-            if uid != chat_id and uid not in notified:
+            if uid not in notified:
                 send_message(uid, notify_text)
                 notified.add(uid)
-        if OWNER_ID != chat_id and OWNER_ID not in notified:
+        if OWNER_ID not in notified:
             send_message(OWNER_ID, notify_text)
+
+        # Notify group
+        send_message(
+            NOTIFY_GROUP_ID,
+            f"🔄 Абдулла ака лид обрабатывается <b>{e_by}</b>\n\n"
+            f"📞 Телефон: {e_phone}\n"
+            f"👤 Имя: {e_name}"
+        )
 
         logger.info("[Working] lead=%s claimed by %s (chat_id=%d)", lead_id, user_label, chat_id)
 
