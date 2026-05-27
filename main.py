@@ -445,10 +445,13 @@ def send_reminders():
             f"🔁 Напоминаний: {lead['reminder_count']}\n\n"
             f"⚠️ Пожалуйста, обработайте лид!"
         )
-        keyboard = {"inline_keyboard": [[
-            {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
-            {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
-        ]]}
+        keyboard = {"inline_keyboard": [
+            [
+                {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
+                {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
+            ],
+            [{"text": "🔄 Уже работаю",            "callback_data": f"working|{lead_id}"}],
+        ]}
 
         for uid in QUALIFY_USER_IDS:
             try:
@@ -767,10 +770,13 @@ def handle_message(msg):
                 f"📅 Дата: {date_str}\n\n"
                 f"Квалифицированный?"
             )
-            qual_keyboard = {"inline_keyboard": [[
-                {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
-                {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
-            ]]}
+            qual_keyboard = {"inline_keyboard": [
+                [
+                    {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
+                    {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
+                ],
+                [{"text": "🔄 Уже работаю",            "callback_data": f"working|{lead_id}"}],
+            ]}
             for uid in QUALIFY_USER_IDS:
                 try:
                     send_message(uid, qual_text, reply_markup=qual_keyboard)
@@ -853,10 +859,13 @@ def handle_callback(cb):
                 f"📅 Дата: {date_str}\n\n"
                 f"Квалифицированный?"
             )
-            qual_keyboard = {"inline_keyboard": [[
-                {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
-                {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
-            ]]}
+            qual_keyboard = {"inline_keyboard": [
+                [
+                    {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
+                    {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
+                ],
+                [{"text": "🔄 Уже работаю",            "callback_data": f"working|{lead_id}"}],
+            ]}
 
             failed_qual_uids = []
             for uid in QUALIFY_USER_IDS:
@@ -929,6 +938,46 @@ def handle_callback(cb):
         label = "✅ Квалифицированный" if qualified else "❌ Не квалифицированный"
         send_message(chat_id, f"{label}\n\nНапишите причину:")
         logger.info("Qual answer=%s lead_id=%s from %s", verdict, lead_id, user_label)
+
+    # ── Already working ──────────────────────────────────────────────────────
+    elif cb_data.startswith("working|"):
+        parts = cb_data.split("|", 1)
+        if len(parts) != 2:
+            return
+        lead_id = parts[1]
+
+        from_user  = cb.get("from", {})
+        uname      = from_user.get("username")
+        fname      = from_user.get("first_name", "")
+        lname      = from_user.get("last_name", "")
+        user_label = f"@{uname}" if uname else (f"{fname} {lname}".strip() or str(chat_id))
+
+        lead = sheet_find_lead(lead_id)
+        e_phone = html_lib.escape(
+            (lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}") if lead else "?"
+        )
+        e_name  = html_lib.escape(str(lead["name"]) if lead else "?")
+        e_by    = html_lib.escape(user_label)
+
+        send_message(chat_id, f"✅ Отлично! Ты отметил что уже работаешь с этим лидом.")
+
+        notify_text = (
+            f"🔄 <b>Лид уже в работе!</b>\n\n"
+            f"🆔 ID: <code>{lead_id}</code>\n"
+            f"📞 Телефон: {e_phone}\n"
+            f"👤 Имя: {e_name}\n\n"
+            f"👤 Работает: <b>{e_by}</b>"
+        )
+        # Notify all other qualifiers and owner
+        notified = set()
+        for uid in QUALIFY_USER_IDS:
+            if uid != chat_id and uid not in notified:
+                send_message(uid, notify_text)
+                notified.add(uid)
+        if OWNER_ID != chat_id and OWNER_ID not in notified:
+            send_message(OWNER_ID, notify_text)
+
+        logger.info("[Working] lead=%s claimed by %s (chat_id=%d)", lead_id, user_label, chat_id)
 
     # ── Skip ─────────────────────────────────────────────────────────────────
     elif cb_data == "skip":
