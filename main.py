@@ -338,32 +338,85 @@ def lead_info(lead_id, e_call, e_name, date_str):
 
 # ─── Schedulers ───────────────────────────────────────────────────────────────
 
-def auto_sync_sheets():
-    """Автоматическая синхронизация всех лидов в Google Sheets каждые 24 часа."""
-    logger.info("[AutoSync] Starting sheets sync...")
+def sync_to_sheets(notify_chat_id=None):
+    """
+    Умная синхронизация:
+    - Новые лиды (которых нет в таблице) вставляются сверху (строка 4)
+    - У обработанных лидов обновляются колонки E и F
+    - Старые строки не удаляются
+    """
+    logger.info("[Sync] Starting smart sync...")
     try:
+        sheets = get_sheets()
+
+        # Читаем все ID которые уже есть в таблице
+        res = sheets.values().get(spreadsheetId=SHEETS_ID, range="A4:A10000").execute()
+        existing_ids = set()
+        existing_rows = res.get("values", [])
+        for i, row in enumerate(existing_rows):
+            if row:
+                existing_ids.add(row[0])
+
         with get_db() as conn:
             all_leads = qall(conn, "SELECT * FROM leads ORDER BY created_at DESC")
-        if not all_leads:
-            return
-        sheets = get_sheets()
-        sheets.values().clear(spreadsheetId=SHEETS_ID, range="A4:F10000").execute()
-        rows = []
+
+        added = 0
+        updated = 0
+
         for lead in all_leads:
+            lead_id = lead["lead_id"]
             status = lead.get("status", "PENDING")
             reason = lead.get("reason", "") or ""
             status_label = "QUALIFIED" if status in ("QUALIFIED","FOLLOWUP_DONE") else ("DONE" if status == "DONE" else "PENDING")
-            rows.append([lead["lead_id"], lead["date_str"], lead.get("name","") or "", lead["phone"], reason, status_label])
-        sheets.values().update(
-            spreadsheetId=SHEETS_ID, range=f"A4:F{3+len(rows)}",
-            valueInputOption="USER_ENTERED", body={"values": rows}
-        ).execute()
-        with get_db() as conn:
-            for i, lead in enumerate(all_leads):
-                qrun(conn, "UPDATE leads SET sheet_row=%s WHERE lead_id=%s", [4+i, lead["lead_id"]])
-        logger.info("[AutoSync] Done: %d leads synced", len(rows))
+
+            if lead_id not in existing_ids:
+                # Новый лид — вставляем в строку 4 (сдвигаем остальные вниз)
+                sheets.batchUpdate(
+                    spreadsheetId=SHEETS_ID,
+                    body={"requests": [{"insertDimension": {
+                        "range": {"sheetId": 0, "dimension": "ROWS",
+                                  "startIndex": 3, "endIndex": 4},
+                        "inheritFromBefore": False
+                    }}]}
+                ).execute()
+                sheets.values().update(
+                    spreadsheetId=SHEETS_ID,
+                    range="A4:F4",
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[lead_id, lead["date_str"], lead.get("name","") or "", lead["phone"], reason, status_label]]}
+                ).execute()
+                existing_ids.add(lead_id)
+                added += 1
+                # Обновляем sheet_row в БД
+                with get_db() as conn:
+                    qrun(conn, "UPDATE leads SET sheet_row=4 WHERE lead_id=%s", [lead_id])
+            else:
+                # Лид уже есть — только обновляем E и F если есть результат
+                if status in ("QUALIFIED", "DONE", "FOLLOWUP_DONE") and reason:
+                    real_row = sheet_find_row(lead_id)
+                    if real_row:
+                        sheets.values().update(
+                            spreadsheetId=SHEETS_ID,
+                            range=f"E{real_row}:F{real_row}",
+                            valueInputOption="USER_ENTERED",
+                            body={"values": [[reason, status_label]]}
+                        ).execute()
+                        updated += 1
+
+        logger.info("[Sync] Done: added=%d updated=%d", added, updated)
+        return added, updated
+
     except Exception as e:
-        logger.error("[AutoSync] Failed: %s", e)
+        logger.error("[Sync] Failed: %s", e)
+        raise
+
+
+def auto_sync_sheets():
+    """Автоматическая синхронизация каждые 24 часа."""
+    try:
+        sync_to_sheets()
+    except Exception as e:
+        logger.error("[AutoSync] %s", e)
 
 
 def send_reminders():
@@ -460,67 +513,18 @@ def handle_message(msg):
             f"📈 Конверсия: <b>{rate}%</b>")
         return
 
-    # /sync_sheets — полная перезапись таблицы из БД
+    # /sync_sheets — добавить новые лиды, обновить результаты (старые не трогать)
     if text_body and text_body.startswith("/sync_sheets") and chat_id == OWNER_ID:
-        send_message(OWNER_ID, "🔄 Начинаю синхронизацию с Google Sheets...")
+        send_message(OWNER_ID, "🔄 Синхронизирую с Google Sheets...")
         try:
-            with get_db() as conn:
-                # Берём все лиды от новых к старым (новые будут сверху)
-                all_leads = qall(conn, "SELECT * FROM leads ORDER BY created_at DESC")
-
-            if not all_leads:
-                send_message(OWNER_ID, "ℹ️ В базе нет лидов.")
-                return
-
-            sheets = get_sheets()
-
-            # 1. Очищаем данные начиная с строки 4 (заголовки в строке 3 не трогаем)
-            sheets.values().clear(
-                spreadsheetId=SHEETS_ID,
-                range="A4:F10000"
-            ).execute()
-
-            # 2. Формируем все строки сразу
-            rows = []
-            for lead in all_leads:
-                status = lead.get("status", "PENDING")
-                reason = lead.get("reason", "") or ""
-                if status in ("QUALIFIED", "FOLLOWUP_DONE"):
-                    status_label = "QUALIFIED"
-                elif status == "DONE":
-                    status_label = "DONE"
-                else:
-                    status_label = "PENDING"
-                rows.append([
-                    lead["lead_id"],
-                    lead["date_str"],
-                    lead.get("name", "") or "",
-                    lead["phone"],
-                    reason,
-                    status_label
-                ])
-
-            # 3. Записываем все одним запросом
-            sheets.values().update(
-                spreadsheetId=SHEETS_ID,
-                range=f"A4:F{3 + len(rows)}",
-                valueInputOption="USER_ENTERED",
-                body={"values": rows}
-            ).execute()
-
-            # 4. Обновляем sheet_row в БД
-            with get_db() as conn:
-                for i, lead in enumerate(all_leads):
-                    qrun(conn, "UPDATE leads SET sheet_row=%s WHERE lead_id=%s",
-                         [4 + i, lead["lead_id"]])
-
+            added, updated = sync_to_sheets()
             send_message(OWNER_ID,
                 f"✅ <b>Синхронизация завершена</b>\n\n"
-                f"📋 Записано лидов: <b>{len(rows)}</b>\n"
-                f"📊 Таблица обновлена от новых к старым")
+                f"➕ Добавлено новых лидов: <b>{added}</b>\n"
+                f"✏️ Обновлено результатов: <b>{updated}</b>\n"
+                f"📌 Старые данные не тронуты")
         except Exception as e:
-            logger.error("[SyncSheets] %s", e)
-            send_message(OWNER_ID, f"❌ Ошибка синхронизации: {html_lib.escape(str(e))}")
+            send_message(OWNER_ID, f"❌ Ошибка: {html_lib.escape(str(e))}")
         return
 
     # /resend_today
