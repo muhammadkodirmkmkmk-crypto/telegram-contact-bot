@@ -192,12 +192,40 @@ def sheets_call(fn, retries=3):
 def sheet_insert_lead(lead_id, date_str, name, phone):
     sheets = get_sheets()
     def _do():
+        # Вставляем новую строку сразу после заголовка (строка 4)
+        sheets.batchUpdate(
+            spreadsheetId=SHEETS_ID,
+            body={"requests": [{"insertDimension": {
+                "range": {"sheetId": 0, "dimension": "ROWS",
+                          "startIndex": DATA_START_ROW - 1, "endIndex": DATA_START_ROW},
+                "inheritFromBefore": False
+            }}]}
+        ).execute()
+        sheets.values().update(
+            spreadsheetId=SHEETS_ID,
+            range=f"A{DATA_START_ROW}:F{DATA_START_ROW}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[lead_id, date_str, name, phone, "", "PENDING"]]}
+        ).execute()
+        # Узнаём реальную строку этого лида (ищем по lead_id)
         res = sheets.values().get(spreadsheetId=SHEETS_ID, range="A:A").execute()
-        row = max(len(res.get("values", [])) + 1, DATA_START_ROW)
-        sheets.values().append(spreadsheetId=SHEETS_ID, range=f"A{row}",
-            valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
-            body={"values": [[lead_id, date_str, name, phone, "", "PENDING"]]}).execute()
-        return row
+        values = res.get("values", [])
+        for idx, row_val in enumerate(values):
+            if row_val and row_val[0] == lead_id:
+                return idx + 1  # 1-based
+        return DATA_START_ROW
+    return sheets_call(_do)
+
+def sheet_find_row(lead_id):
+    """Найти реальную строку лида по ID."""
+    sheets = get_sheets()
+    def _do():
+        res = sheets.values().get(spreadsheetId=SHEETS_ID, range="A:A").execute()
+        values = res.get("values", [])
+        for idx, row_val in enumerate(values):
+            if row_val and row_val[0] == lead_id:
+                return idx + 1
+        return None
     return sheets_call(_do)
 
 def sheet_update_row(sheet_row, reason, status):
@@ -429,7 +457,14 @@ def handle_message(msg):
             db_mark_processed(lead_id, full_reason, qualified=qualified)
             send_message(chat_id, f"✅ Сохранено!\n<i>{html_lib.escape(full_reason)}</i>")
             if lead.get("sheet_row"):
-                try: sheet_update_row(lead["sheet_row"], full_reason, "QUALIFIED" if qualified else "DONE")
+                try:
+                    # Если sheet_row=4 для всех (старый баг), ищем реальную строку
+                    sheet_row = lead["sheet_row"]
+                    try:
+                        real_row = sheet_find_row(lead["lead_id"])
+                        if real_row: sheet_row = real_row
+                    except Exception: pass
+                    sheet_update_row(sheet_row, full_reason, "QUALIFIED" if qualified else "DONE")
                 except Exception as e: logger.error("[Sheets] %s", e)
             _send_report(lead, user_label, qualified, full_reason)
             ep = html_lib.escape(normalize_phone(lead["phone"])); en = html_lib.escape(str(lead["name"]))
