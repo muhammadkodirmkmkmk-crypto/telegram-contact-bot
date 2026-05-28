@@ -698,7 +698,7 @@ def handle_message(msg):
             send_message(chat_id, "❌ Лид не найден в таблице.")
             return
 
-        if lead["status"] == "DONE":
+        if not lead["status"].startswith("PENDING"):
             send_message(chat_id, "ℹ️ Этот лид уже обработан другим квалификатором.")
             return
 
@@ -725,8 +725,12 @@ def handle_message(msg):
         state          = pending_followup.pop(chat_id)
         lead_id        = state["lead_id"]
         followup_round = state["round"]
-        user_label     = state.get("user_label", str(chat_id))
-        stage_text     = text_body.strip()
+        # Always use the actual responder's identity, not a stored placeholder
+        _uname     = sender.get("username")
+        _fname     = sender.get("first_name", "")
+        _lname     = sender.get("last_name", "")
+        user_label = f"@{_uname}" if _uname else (f"{_fname} {_lname}".strip() or str(chat_id))
+        stage_text = text_body.strip()
 
         lead = sheet_find_lead(lead_id)
         if not lead:
@@ -803,7 +807,8 @@ def handle_message(msg):
     e_sender = html_lib.escape(str(sender_display))
 
     # ── Auto-save ALL contacts (human or bot) ─────────────────────────────────
-    lead_id    = datetime.now().strftime("%Y%m%d%H%M%S")
+    _now    = datetime.now()
+    lead_id = _now.strftime("%Y%m%d%H%M%S") + str(_now.microsecond // 1000).zfill(3)
     call_phone = normalize_phone(phone)
     e_call     = html_lib.escape(call_phone)
     e_name2    = html_lib.escape(str(name))
@@ -813,18 +818,7 @@ def handle_message(msg):
         logger.info("[AutoSave] lead_id=%s phone=%s name=%s sender=%s",
                     lead_id, phone, name, sender_display)
 
-        # Notify owner
-        send_message(
-            OWNER_ID,
-            f"📥 <b>Новый контакт сохранён</b>\n"
-            f"📞 Телефон: <code>{e_call}</code>\n"
-            f"👤 Имя: {e_name2}\n"
-            f"👤 Кто скинул: {e_sender}\n"
-            f"📅 Дата: {date_str}\n"
-            f"🆔 ID: <code>{lead_id}</code>"
-        )
-
-        # Send to qualifiers
+        # Send to qualifiers (owner gets one combined message with buttons)
         qual_text = (
             f"📋 <b>Новый лид на квалификацию</b>\n"
             f"🆔 ID: <code>{lead_id}</code>\n"
@@ -960,7 +954,7 @@ def handle_callback(cb):
             send_message(chat_id, "❌ Лид не найден в таблице.")
             return
 
-        if lead["status"] == "DONE":
+        if not lead["status"].startswith("PENDING"):
             send_message(chat_id, "ℹ️ Этот лид уже обработан другим квалификатором.")
             return
 
