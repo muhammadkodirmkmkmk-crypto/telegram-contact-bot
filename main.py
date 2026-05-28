@@ -230,6 +230,32 @@ def sheet_get_pending():
     return pending
 
 
+# ─── Phone normalizer ─────────────────────────────────────────────────────────
+
+def normalize_phone(raw: str) -> str:
+    """
+    Normalize any phone number to E.164 format.
+    Defaults to Uzbekistan (+998) when no country code is present.
+    Examples:
+      909050505      → +998909050505
+      998909050505   → +998909050505
+      +998901234567  → +998901234567
+      +79991234567   → +79991234567
+    """
+    digits = re.sub(r'\D', '', str(raw))
+    if str(raw).strip().startswith('+'):
+        return f"+{digits}"
+    if digits.startswith('998') and len(digits) == 12:
+        return f"+{digits}"
+    if len(digits) == 9:
+        # Uzbek local format (9 digits)
+        return f"+998{digits}"
+    if digits.startswith('8') and len(digits) == 11:
+        # Russian 8-XXX format
+        return f"+7{digits[1:]}"
+    return f"+{digits}"
+
+
 # ─── Multi-line lead parser ───────────────────────────────────────────────────
 
 # Matches phone numbers in many formats:
@@ -433,7 +459,7 @@ def send_reminders():
 
         n          = lead["reminder_count"] + 1
         lead_id    = lead["lead_id"]
-        call_phone = lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}"
+        call_phone = normalize_phone(lead["phone"])
 
         text = (
             f"⏰ <b>Напоминание #{n} — необработанный лид!</b>\n\n"
@@ -484,7 +510,7 @@ def send_3day_followups():
 
     for lead in leads:
         lead_id    = lead["lead_id"]
-        call_phone = lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}"
+        call_phone = normalize_phone(lead["phone"])
         e_phone    = html_lib.escape(call_phone)
         e_name     = html_lib.escape(str(lead["name"]))
 
@@ -525,7 +551,7 @@ def send_processing_report(lead, processed_by, qualified, reason, created_at_iso
         total_min   = int((now - created_at).total_seconds() / 60)
         hours, mins = divmod(total_min, 60)
 
-        call_phone     = lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}"
+        call_phone     = normalize_phone(lead["phone"])
         reminder_count = lead.get("reminder_count", 0)
         qual_label     = "✅ Квалифицированный" if qualified else "❌ Не квалифицированный"
         e_phone        = html_lib.escape(call_phone)
@@ -618,6 +644,47 @@ def handle_message(msg):
     chat_id   = msg.get("chat", {}).get("id") or sender.get("id")
     text_body = msg.get("text", "") or msg.get("caption", "")
 
+    # ── Owner command: /resend_today ─────────────────────────────────────────
+    if text_body and text_body.startswith("/resend_today") and chat_id == OWNER_ID:
+        today  = datetime.now().strftime("%d.%m.%Y")
+        target = 5028786313
+        leads  = [l for l in sheet_read_all() if l.get("date_str") == today]
+        if not leads:
+            send_message(OWNER_ID, f"ℹ️ Сегодня ({today}) лидов нет.")
+            return
+        send_message(OWNER_ID, f"📤 Отправляю {len(leads)} лидов → {target}...")
+        sent = 0
+        for lead in leads:
+            e_call   = html_lib.escape(normalize_phone(lead["phone"]))
+            e_name_r = html_lib.escape(str(lead["name"]))
+            lid      = lead["lead_id"]
+            status   = lead.get("status", "")
+            status_label = (
+                "✅ Квалифицирован" if status.startswith("QUALIFIED") or status == "FOLLOWUP_DONE"
+                else ("❌ Не квалифицирован" if status == "DONE" and "Не квалиф" in lead.get("reason","")
+                else ("⏳ Ожидает" if status.startswith("PENDING") else html_lib.escape(status)))
+            )
+            qual_text = (
+                f"📋 <b>Лид за {today} (повтор)</b>\n"
+                f"🆔 ID: <code>{lid}</code>\n"
+                f"📞 Телефон: {e_call}\n"
+                f"👤 Имя: {e_name_r}\n"
+                f"📊 Статус: {status_label}\n\n"
+                f"Квалифицированный?"
+            )
+            qual_kb = {"inline_keyboard": [
+                [
+                    {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lid}"},
+                    {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lid}"},
+                ],
+                [{"text": "🔄 Уже работаю", "callback_data": f"working|{lid}"}],
+            ]}
+            result = send_message(target, qual_text, reply_markup=qual_kb)
+            if result:
+                sent += 1
+        send_message(OWNER_ID, f"✅ Готово! Отправлено {sent}/{len(leads)} лидов → {target}.")
+        return
+
     # ── Waiting for qualifier's reason text (checked FIRST — highest priority) ──
     if chat_id in pending_reason and text_body:
         state      = pending_reason.pop(chat_id)
@@ -666,7 +733,7 @@ def handle_message(msg):
             send_message(chat_id, "❌ Лид не найден в таблице.")
             return
 
-        e_phone  = html_lib.escape(lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}")
+        e_phone  = html_lib.escape(normalize_phone(lead["phone"]))
         e_name   = html_lib.escape(str(lead["name"]))
         e_stage  = html_lib.escape(stage_text)
         e_by     = html_lib.escape(user_label)
@@ -737,7 +804,7 @@ def handle_message(msg):
 
     # ── Auto-save ALL contacts (human or bot) ─────────────────────────────────
     lead_id    = datetime.now().strftime("%Y%m%d%H%M%S")
-    call_phone = phone if phone.startswith("+") else f"+{phone}"
+    call_phone = normalize_phone(phone)
     e_call     = html_lib.escape(call_phone)
     e_name2    = html_lib.escape(str(name))
 
@@ -775,10 +842,15 @@ def handle_message(msg):
             [{"text": "🔄 Уже работаю",            "callback_data": f"working|{lead_id}"}],
         ]}
         for uid in QUALIFY_USER_IDS:
-            try:
-                send_message(uid, qual_text, reply_markup=qual_keyboard)
-            except Exception as q_exc:
-                logger.error("[AutoSave] qual send to %d failed: %s", uid, q_exc)
+            result = send_message(uid, qual_text, reply_markup=qual_keyboard)
+            if result is None:
+                logger.error("[AutoSave] qual send FAILED to uid=%d", uid)
+                if uid != OWNER_ID:
+                    send_message(
+                        OWNER_ID,
+                        f"⚠️ Не удалось отправить лид квалификатору {uid}.\n"
+                        f"Возможно он не начал диалог с ботом."
+                    )
 
         # Notify group
         send_message(
@@ -823,7 +895,7 @@ def handle_callback(cb):
             )
             logger.info("Saved lead_id=%s phone=%s name=%s", lead_id, phone, name)
 
-            call_phone = phone if phone.startswith("+") else f"+{phone}"
+            call_phone = normalize_phone(phone)
             e_call     = html_lib.escape(str(call_phone))
             qual_text  = (
                 f"📋 <b>Новый лид на квалификацию</b>\n"
@@ -927,9 +999,7 @@ def handle_callback(cb):
         user_label = f"@{uname}" if uname else (f"{fname} {lname}".strip() or str(chat_id))
 
         lead = sheet_find_lead(lead_id)
-        e_phone = html_lib.escape(
-            (lead["phone"] if lead["phone"].startswith("+") else f"+{lead['phone']}") if lead else "?"
-        )
+        e_phone = html_lib.escape(normalize_phone(lead["phone"]) if lead else "?")
         e_name  = html_lib.escape(str(lead["name"]) if lead else "?")
         e_by    = html_lib.escape(user_label)
 
