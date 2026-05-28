@@ -427,6 +427,55 @@ def handle_message(msg):
             f"📈 Конверсия: <b>{rate}%</b>")
         return
 
+    # /sync_sheets — записать все необработанные лиды в таблицу
+    if text_body and text_body.startswith("/sync_sheets") and chat_id == OWNER_ID:
+        send_message(OWNER_ID, "🔄 Начинаю синхронизацию с Google Sheets...")
+        try:
+            with get_db() as conn:
+                all_leads = qall(conn, "SELECT * FROM leads ORDER BY created_at ASC")
+            
+            synced = 0
+            updated = 0
+            errors = 0
+            
+            for lead in all_leads:
+                lead_id = lead["lead_id"]
+                try:
+                    # Ищем строку в таблице
+                    real_row = sheet_find_row(lead_id)
+                    
+                    if not real_row:
+                        # Лида нет в таблице — добавляем
+                        sheet_row = sheet_insert_lead(
+                            lead_id, lead["date_str"],
+                            lead["name"] or "", lead["phone"]
+                        )
+                        with get_db() as conn:
+                            qrun(conn, "UPDATE leads SET sheet_row=%s WHERE lead_id=%s", [sheet_row, lead_id])
+                        real_row = sheet_row
+                        synced += 1
+                    
+                    # Если есть результат — обновляем колонки E и F
+                    if lead["status"] in ("QUALIFIED", "DONE", "FOLLOWUP_DONE") and lead.get("reason"):
+                        status_label = "QUALIFIED" if lead["status"] in ("QUALIFIED","FOLLOWUP_DONE") else "DONE"
+                        sheet_update_row(real_row, lead["reason"], status_label)
+                        updated += 1
+                    elif lead["status"] == "PENDING":
+                        sheet_update_row(real_row, "", "PENDING")
+                        
+                except Exception as e:
+                    logger.error("[SyncSheets] lead=%s: %s", lead_id, e)
+                    errors += 1
+            
+            send_message(OWNER_ID,
+                f"✅ <b>Синхронизация завершена</b>\n\n"
+                f"➕ Добавлено новых строк: <b>{synced}</b>\n"
+                f"✏️ Обновлено результатов: <b>{updated}</b>\n"
+                f"❌ Ошибок: <b>{errors}</b>")
+        except Exception as e:
+            send_message(OWNER_ID, f"❌ Ошибка синхронизации: {html_lib.escape(str(e))}")
+        return
+
     # /resend_today
     if text_body and text_body.startswith("/resend_today") and chat_id == OWNER_ID:
         today = datetime.now().strftime("%d.%m.%Y")
