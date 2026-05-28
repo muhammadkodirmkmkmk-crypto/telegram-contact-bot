@@ -217,52 +217,59 @@ def normalize_phone(raw):
     if digits.startswith('8') and len(digits) == 11: return f"+7{digits[1:]}"
     return f"+{digits}"
 
-PHONE_RE       = re.compile(r'(?<!\d)(\+?[1-9][\d\s\-\.\(\)]{5,20}[\d])(?!\d)')
+# Принимаем ЛЮБОЙ номер — минимум 5 цифр подряд
+PHONE_RE = re.compile(r'(\+?[\d][\d\s\-\.\(\)]{3,25}[\d])')
+NAME_LABEL_RE = re.compile(r'^(?:имя|name|клиент|client|фио|от|from)\s*[:\-]?\s*', re.IGNORECASE)
 PHONE_LABEL_RE = re.compile(r'^(?:телефон|тел|phone|tel|моб|mob|номер|number)\s*[:\-]?\s*', re.IGNORECASE)
-NAME_LABEL_RE  = re.compile(r'^(?:имя|name|клиент|client|фио|от|from)\s*[:\-]?\s*', re.IGNORECASE)
 
 def extract_phone(raw):
+    """Извлекает номер — принимает всё у чего >= 5 цифр."""
     cleaned = re.sub(r'[\s\-\.\(\)]', '', raw)
-    return cleaned if len(re.sub(r'\D', '', cleaned)) >= 7 else None
+    digits = re.sub(r'\D', '', cleaned)
+    return cleaned if len(digits) >= 5 else None
 
 def parse_lead_text(text_body, entities):
     if not text_body: return None, None
     lines = [l.strip() for l in text_body.split('\n') if l.strip()]
-    phone = None
+
+    # 1. Telegram entity phone_number (самый надёжный)
     for ent in (entities or []):
         if ent.get("type") == "phone_number":
             phone = text_body[ent["offset"]: ent["offset"] + ent["length"]]
-            break
-    structured_name = structured_phone = None
-    for line in lines:
-        if PHONE_LABEL_RE.match(line):
-            m = PHONE_RE.search(PHONE_LABEL_RE.sub('', line))
-            if m: structured_phone = extract_phone(m.group(0))
-        elif NAME_LABEL_RE.match(line):
-            val = NAME_LABEL_RE.sub('', line).strip()
-            if val and re.search(r'[a-zA-Zа-яА-ЯёЁ]', val): structured_name = val
-    if structured_phone: return structured_phone, structured_name
+            name = None
+            for line in lines:
+                c = NAME_LABEL_RE.sub('', line).strip()
+                if c and re.search(r'[a-zA-Zа-яА-ЯёЁ]', c) and not re.search(r'\d{5}', c):
+                    name = c; break
+            return phone, name
+
+    # 2. Ищем любую строку с цифрами >= 5
+    phone = None
     phone_line_idx = None
     for i, line in enumerate(lines):
-        m = PHONE_RE.search(line)
-        if m:
-            c = extract_phone(m.group(0))
-            if c: phone = phone or c; phone_line_idx = i; break
+        digits_in_line = re.sub(r'\D', '', line)
+        if len(digits_in_line) >= 5:
+            m = PHONE_RE.search(line)
+            if m:
+                c = extract_phone(m.group(0))
+                if c:
+                    phone = c
+                    phone_line_idx = i
+                    break
+
     if not phone: return None, None
+
+    # 3. Ищем имя рядом с номером
     name = None
-    if phone_line_idx and phone_line_idx > 0:
-        c = NAME_LABEL_RE.sub('', lines[phone_line_idx - 1]).strip()
-        if re.search(r'[a-zA-Zа-яА-ЯёЁ]', c): name = c
-    if not name and phone_line_idx is not None:
-        for j in range(phone_line_idx+1, min(phone_line_idx+3, len(lines))):
-            c = NAME_LABEL_RE.sub('', lines[j]).strip()
-            if re.search(r'[a-zA-Zа-яА-ЯёЁ]', c): name = c; break
-    if not name:
-        for line in lines:
-            c = NAME_LABEL_RE.sub('', line).strip()
-            if not c or not re.search(r'[a-zA-Zа-яА-ЯёЁ]', c): continue
-            if PHONE_RE.search(c) and len(re.sub(r'\D', '', c)) >= 7: continue
-            if len(c.split()) >= 2: name = c; break
+    for i, line in enumerate(lines):
+        if i == phone_line_idx: continue
+        c = NAME_LABEL_RE.sub('', line).strip()
+        if not c: continue
+        if not re.search(r'[a-zA-Zа-яА-ЯёЁ]', c): continue
+        if len(re.sub(r'\D', '', c)) >= 5: continue  # пропускаем строки с номерами
+        name = c
+        break
+
     return phone, name
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
@@ -310,10 +317,10 @@ def send_reminders():
         text = (f"⏰ <b>Напоминание #{n} — необработанный лид!</b>\n\n"
                 f"{lead_info(lid, html_lib.escape(phone), html_lib.escape(str(lead['name'])), lead['date_str'])}\n"
                 f"🕐 Ожидает: {elapsed} мин.\n\nПримите или отклоните:")
+        send_message(OWNER_ID, text, reply_markup=keyboard_main(lid))
         send_message(MAIN_QUALIFIER_ID, text, reply_markup=keyboard_main(lid))
         if lead["status"] == "ASSIGNED" and lead["assigned_to"] == SECOND_QUALIFIER_ID:
             send_message(SECOND_QUALIFIER_ID, text, reply_markup=keyboard_second(lid))
-        send_message(NOTIFY_GROUP_ID, f"⏰ Необработанный лид #{n}\n📞 {html_lib.escape(phone)} | {elapsed} мин.")
         try: db_increment_reminder(lid)
         except Exception as e: logger.error("[Reminder] inc: %s", e)
 
@@ -408,8 +415,9 @@ def handle_message(msg):
                 except Exception as e: logger.error("[Sheets] %s", e)
             _send_report(lead, user_label, qualified, full_reason)
             ep = html_lib.escape(normalize_phone(lead["phone"])); en = html_lib.escape(str(lead["name"]))
+            # В группу — только краткий итог
             send_message(NOTIFY_GROUP_ID,
-                f"{'✅' if qualified else '❌'} Лид обработан\n📞 {ep} | {en}\n👤 {html_lib.escape(user_label)}\n💬 {html_lib.escape(reason)}")
+                f"{'✅' if qualified else '❌'} Лид обработан: {ep} | {en}")
             if qualified:
                 proc_id = lead.get("assigned_to") or MAIN_QUALIFIER_ID
                 with get_db() as conn:
@@ -464,9 +472,13 @@ def handle_message(msg):
             sheet_row = sheet_insert_lead(lead_id, date_str, name, phone)
             db_set_sheet_row(lead_id, sheet_row)
         except Exception as e: logger.error("[Sheets] %s", e)
-        send_message(OWNER_ID, f"📥 <b>Новый лид получен</b>\n\n{lead_info(lead_id,e_call,e_name,date_str)}\n👤 Кто скинул: {e_sender}")
+        # Владельцу — уведомление + кнопки
+        send_message(OWNER_ID, f"📥 <b>Новый лид получен</b>\n\n{lead_info(lead_id,e_call,e_name,date_str)}\n👤 Кто скинул: {e_sender}\n\nПримите или отклоните:",
+                     reply_markup=keyboard_main(lead_id))
+        # Главному квалификатору — с кнопками
         send_message(MAIN_QUALIFIER_ID, f"📋 <b>Новый лид</b>\n\n{lead_info(lead_id,e_call,e_name,date_str)}\n👤 Кто скинул: {e_sender}\n\nПримите или отклоните:",
                      reply_markup=keyboard_main(lead_id))
+        # В группу — только краткое уведомление
         send_message(NOTIFY_GROUP_ID, f"📥 Новый лид\n📞 {e_call} | {e_name}\n👤 От: {e_sender}")
     except Exception as e:
         logger.error("[AutoSave] %s", e)
@@ -489,7 +501,7 @@ def handle_callback(cb):
                      reply_markup=keyboard_qual(lead_id))
 
     elif cb_data.startswith("reject|"):
-        if chat_id != MAIN_QUALIFIER_ID: send_message(chat_id, "⛔ Нет прав."); return
+        if chat_id not in (MAIN_QUALIFIER_ID, OWNER_ID): send_message(chat_id, "⛔ Нет прав."); return
         lead_id = cb_data.split("|",1)[1]
         lead = db_find_lead(lead_id)
         if not lead: send_message(chat_id, "❌ Лид не найден."); return
@@ -499,8 +511,7 @@ def handle_callback(cb):
         send_message(chat_id, "↩️ Лид передан второму квалификатору.")
         send_message(SECOND_QUALIFIER_ID, f"📋 <b>Новый лид для вас</b>\n\n{lead_info(lead_id,ep,en,lead['date_str'])}\n\nПримите лид:",
                      reply_markup=keyboard_second(lead_id))
-        send_message(OWNER_ID, f"↩️ Лид <code>{lead_id}</code> передан второму квалификатору.")
-        send_message(NOTIFY_GROUP_ID, f"↩️ Лид {lead_id} отклонён → передан второму")
+        send_message(OWNER_ID, f"↩️ Лид <code>{lead_id}</code> отклонён главным, передан второму квалификатору.")
 
     elif cb_data.startswith("qual|"):
         parts = cb_data.split("|")
