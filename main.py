@@ -381,6 +381,24 @@ def handle_message(msg):
         if user_lines: stats += f"\n<b>По квалификаторам:</b>\n{user_lines}"
         send_message(chat_id, stats); return
 
+    # /today — статистика за последние 24 часа
+    if text_body and text_body.startswith("/today") and chat_id in (OWNER_ID, MAIN_QUALIFIER_ID, SECOND_QUALIFIER_ID):
+        since = datetime.now() - timedelta(hours=24)
+        with get_db() as conn:
+            total_24    = qone(conn, "SELECT COUNT(*) as cnt FROM leads WHERE created_at >= %s", [since])["cnt"]
+            qual_24     = qone(conn, "SELECT COUNT(*) as cnt FROM leads WHERE created_at >= %s AND status IN ('QUALIFIED','FOLLOWUP_DONE')", [since])["cnt"]
+            not_qual_24 = qone(conn, "SELECT COUNT(*) as cnt FROM leads WHERE created_at >= %s AND status = 'DONE'", [since])["cnt"]
+            pending_24  = qone(conn, "SELECT COUNT(*) as cnt FROM leads WHERE created_at >= %s AND status IN ('PENDING','ASSIGNED','PROCESSING')", [since])["cnt"]
+        rate = round(qual_24 / max(qual_24 + not_qual_24, 1) * 100)
+        send_message(chat_id,
+            f"📊 <b>Статистика за последние 24 часа</b>\n\n"
+            f"📦 Всего лидов: <b>{total_24}</b>\n"
+            f"✅ Квалифицированных: <b>{qual_24}</b>\n"
+            f"❌ Не квалифицированных: <b>{not_qual_24}</b>\n"
+            f"⏳ Ожидают обработки: <b>{pending_24}</b>\n"
+            f"📈 Конверсия: <b>{rate}%</b>")
+        return
+
     # /resend_today
     if text_body and text_body.startswith("/resend_today") and chat_id == OWNER_ID:
         today = datetime.now().strftime("%d.%m.%Y")
