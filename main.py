@@ -519,6 +519,41 @@ def handle_message(msg):
             f"📈 Конверсия: <b>{rate}%</b>")
         return
 
+    # /delete <lead_id> — удалить лид по ID (только владелец)
+    if text_body and text_body.startswith("/delete") and chat_id == OWNER_ID:
+        parts = text_body.strip().split()
+        if len(parts) < 2:
+            # Показать последние 10 лидов с кнопками удаления
+            with get_db() as conn:
+                recent = qall(conn, "SELECT * FROM leads ORDER BY created_at DESC LIMIT 10")
+            if not recent:
+                send_message(OWNER_ID, "ℹ️ Лидов нет.")
+                return
+            for lead in recent:
+                lid = lead["lead_id"]
+                ep  = html_lib.escape(normalize_phone(lead["phone"]))
+                en  = html_lib.escape(str(lead["name"] or ""))
+                st  = lead.get("status","")
+                send_message(OWNER_ID,
+                    f"{'✅' if st in ('QUALIFIED','FOLLOWUP_DONE') else '❌' if st=='DONE' else '⏳'} "
+                    f"{ep} | {en} | {lead['date_str']}",
+                    reply_markup={"inline_keyboard": [[
+                        {"text": "🗑 Удалить", "callback_data": f"delete|{lid}"}
+                    ]]})
+            return
+        # /delete <lead_id>
+        lead_id = parts[1]
+        lead = db_find_lead(lead_id)
+        if not lead:
+            send_message(OWNER_ID, f"❌ Лид <code>{lead_id}</code> не найден.")
+            return
+        ep = html_lib.escape(normalize_phone(lead["phone"]))
+        en = html_lib.escape(str(lead["name"] or ""))
+        send_message(OWNER_ID,
+            f"🗑 <b>Удалить лид?</b>\n\n{lead_info(lead_id, ep, en, lead['date_str'])}",
+            reply_markup=keyboard_delete_confirm(lead_id))
+        return
+
     # /sync_sheets — добавить новые лиды, обновить результаты (старые не трогать)
     if text_body and text_body.startswith("/sync_sheets") and chat_id == OWNER_ID:
         send_message(OWNER_ID, "🔄 Синхронизирую с Google Sheets...")
@@ -736,6 +771,7 @@ def set_commands():
     owner_commands = [
         {"command": "stats",        "description": "📊 Полная статистика"},
         {"command": "today",        "description": "📅 Статистика за 24 часа"},
+        {"command": "delete",       "description": "🗑 Удалить лид (последние 10)"},
         {"command": "sync_sheets",  "description": "🔄 Синхронизировать с Google Sheets"},
         {"command": "resend_today", "description": "📤 Переотправить лиды за сегодня"},
     ]
