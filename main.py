@@ -7,6 +7,7 @@ import time
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 from flask import Flask, request
 import requests
 from google.oauth2 import service_account
@@ -22,14 +23,14 @@ app = Flask(__name__)
 
 BOT_TOKEN               = os.environ["TELEGRAM_BOT_TOKEN"]
 WEBHOOK_URL             = os.environ["WEBHOOK_URL"]
-OWNER_ID                = int(os.environ["OWNER_TELEGRAM_ID"])       # 7871931220 — только отчёты
+OWNER_ID                = int(os.environ["OWNER_TELEGRAM_ID"])       # 7871931220
 SHEETS_ID               = os.environ["GOOGLE_SHEETS_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 DATABASE_URL            = os.environ["DATABASE_URL"]
 
-MAIN_QUALIFIER_ID       = 514275093    # главный — видит принять/отказать
-SECOND_QUALIFIER_ID     = 5028786313   # второй  — видит только принять
-NOTIFY_GROUP_ID         = -5160536788
+MAIN_QUALIFIER_ID       = 514275093    # главный — принять/отказать
+SECOND_QUALIFIER_ID     = 5028786313   # второй  — только принять
+NOTIFY_GROUP_ID         = -5160536788  # группа уведомлений
 
 API_BASE                = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SCOPES                  = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -38,8 +39,17 @@ DATA_START_ROW          = 4
 
 # ─── DB ───────────────────────────────────────────────────────────────────────
 
+@contextmanager
 def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -72,7 +82,6 @@ def init_db():
                     created_at     TIMESTAMP DEFAULT NOW()
                 )
             """)
-        conn.commit()
     logger.info("[DB] Tables ready")
 
 
@@ -86,7 +95,6 @@ def db_insert_lead(lead_id, date_str, name, phone):
                 VALUES (%s, %s, %s, %s, 'PENDING', NOW(), NOW())
                 ON CONFLICT (lead_id) DO NOTHING
             """, (lead_id, date_str, name or '', phone))
-        conn.commit()
 
 
 def db_find_lead(lead_id):
@@ -97,14 +105,12 @@ def db_find_lead(lead_id):
 
 
 def db_assign_lead(lead_id, qualifier_id):
-    """Assign lead to a specific qualifier (used when main rejects)."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE leads SET assigned_to = %s, status = 'ASSIGNED', updated_at = NOW()
                 WHERE lead_id = %s
             """, (qualifier_id, lead_id))
-        conn.commit()
 
 
 def db_claim_lead(lead_id, user_label, qualifier_id):
@@ -116,9 +122,7 @@ def db_claim_lead(lead_id, user_label, qualifier_id):
                 SET status = 'PROCESSING', processed_by = %s, assigned_to = %s, updated_at = NOW()
                 WHERE lead_id = %s AND status IN ('PENDING', 'ASSIGNED')
             """, (user_label, qualifier_id, lead_id))
-            claimed = cur.rowcount > 0
-        conn.commit()
-    return claimed
+            return cur.rowcount > 0
 
 
 def db_mark_processed(lead_id, reason, qualified):
@@ -129,7 +133,6 @@ def db_mark_processed(lead_id, reason, qualified):
                 UPDATE leads SET status = %s, reason = %s, updated_at = NOW(), reminder_count = 0
                 WHERE lead_id = %s
             """, (status, reason, lead_id))
-        conn.commit()
 
 
 def db_advance_followup(lead_id, new_round):
@@ -138,27 +141,34 @@ def db_advance_followup(lead_id, new_round):
             cur.execute("""
                 UPDATE leads SET reminder_count = %s, updated_at = NOW() WHERE lead_id = %s
             """, (new_round, lead_id))
-        conn.commit()
 
 
 def db_get_pending_leads():
+    """Лиды PENDING или ASSIGNED старше REMINDER_INTERVAL_MIN минут."""
     cutoff = datetime.now() - timedelta(minutes=REMINDER_INTERVAL_MIN)
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT * FROM leads WHERE status = 'PENDING' AND created_at <= %s
+                SELECT * FROM leads
+                WHERE status IN ('PENDING', 'ASSIGNED') AND updated_at <= %s
             """, (cutoff,))
             return cur.fetchall()
 
 
 def db_get_qualified_for_followup(days):
+    """
+    days=1 → лиды у которых reminder_count=0 и updated_at <= NOW()-1day
+    days=3 → лиды у которых reminder_count=1 и updated_at <= NOW()-3days (от момента квалификации)
+    """
     expected_round = 0 if days == 1 else 1
     cutoff = datetime.now() - timedelta(days=days)
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT * FROM leads
-                WHERE status = 'QUALIFIED' AND reminder_count = %s AND updated_at <= %s
+                WHERE status = 'QUALIFIED'
+                  AND reminder_count = %s
+                  AND updated_at <= %s
             """, (expected_round, cutoff))
             return cur.fetchall()
 
@@ -167,7 +177,6 @@ def db_set_sheet_row(lead_id, sheet_row):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE leads SET sheet_row = %s WHERE lead_id = %s", (sheet_row, lead_id))
-        conn.commit()
 
 
 def db_increment_reminder(lead_id):
@@ -177,7 +186,6 @@ def db_increment_reminder(lead_id):
                 UPDATE leads SET reminder_count = reminder_count + 1, updated_at = NOW()
                 WHERE lead_id = %s
             """, (lead_id,))
-        conn.commit()
 
 
 # ─── Pending state ────────────────────────────────────────────────────────────
@@ -191,7 +199,6 @@ def db_set_pending_reason(chat_id, lead_id, qualified, user_label):
                 ON CONFLICT (chat_id) DO UPDATE
                 SET state_type='reason', lead_id=%s, qualified=%s, user_label=%s, created_at=NOW()
             """, (chat_id, lead_id, qualified, user_label, lead_id, qualified, user_label))
-        conn.commit()
 
 
 def db_set_pending_followup(chat_id, lead_id, followup_round, user_label):
@@ -203,7 +210,6 @@ def db_set_pending_followup(chat_id, lead_id, followup_round, user_label):
                 ON CONFLICT (chat_id) DO UPDATE
                 SET state_type='followup', lead_id=%s, followup_round=%s, user_label=%s, created_at=NOW()
             """, (chat_id, lead_id, followup_round, user_label, lead_id, followup_round, user_label))
-        conn.commit()
 
 
 def db_get_pending_state(chat_id):
@@ -217,36 +223,28 @@ def db_clear_pending_state(chat_id):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM pending_states WHERE chat_id = %s", (chat_id,))
-        conn.commit()
 
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def keyboard_main_qualifier(lead_id):
-    """Главный квалификатор — принять или отказать."""
-    return {"inline_keyboard": [
-        [
-            {"text": "✅ Принять",  "callback_data": f"accept|{lead_id}"},
-            {"text": "❌ Отказать", "callback_data": f"reject|{lead_id}"},
-        ]
-    ]}
+    return {"inline_keyboard": [[
+        {"text": "✅ Принять",  "callback_data": f"accept|{lead_id}"},
+        {"text": "❌ Отказать", "callback_data": f"reject|{lead_id}"},
+    ]]}
 
 
 def keyboard_second_qualifier(lead_id):
-    """Второй квалификатор — только принять."""
-    return {"inline_keyboard": [
-        [{"text": "✅ Принять", "callback_data": f"accept|{lead_id}"}]
-    ]}
+    return {"inline_keyboard": [[
+        {"text": "✅ Принять", "callback_data": f"accept|{lead_id}"}
+    ]]}
 
 
 def keyboard_qualification(lead_id):
-    """Этап квалификации — квалифицирован или нет."""
-    return {"inline_keyboard": [
-        [
-            {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
-            {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
-        ]
-    ]}
+    return {"inline_keyboard": [[
+        {"text": "✅ Квалифицированный",    "callback_data": f"qual|yes|{lead_id}"},
+        {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
+    ]]}
 
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
@@ -271,24 +269,28 @@ def sheets_call(fn, retries=3):
 
 
 def sheet_insert_lead(lead_id, date_str, name, phone):
+    """Вставляет лид в таблицу и возвращает РЕАЛЬНЫЙ номер строки."""
     sheets = get_sheets()
+
     def _do():
-        sheets.batchUpdate(
+        # Узнаём сколько строк уже занято чтобы вставить в конец данных
+        result = sheets.values().get(
             spreadsheetId=SHEETS_ID,
-            body={"requests": [{"insertDimension": {
-                "range": {"sheetId": 0, "dimension": "ROWS",
-                          "startIndex": DATA_START_ROW - 1, "endIndex": DATA_START_ROW},
-                "inheritFromBefore": False,
-            }}]},
+            range="A:A"
         ).execute()
-        sheets.values().update(
+        existing_rows = len(result.get("values", []))
+        insert_row = max(existing_rows + 1, DATA_START_ROW)
+
+        sheets.values().append(
             spreadsheetId=SHEETS_ID,
-            range=f"A{DATA_START_ROW}:F{DATA_START_ROW}",
+            range=f"A{insert_row}",
             valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
             body={"values": [[lead_id, date_str, name, phone, "", "PENDING"]]},
         ).execute()
-    sheets_call(_do)
-    return DATA_START_ROW
+        return insert_row
+
+    return sheets_call(_do)
 
 
 def sheet_update_row(sheet_row, reason, status):
@@ -468,7 +470,19 @@ def send_reminders():
             f"🕐 Ожидает: {elapsed} мин.\n\n"
             f"Примите или отклоните лид:"
         )
+        # Напоминание главному квалификатору
         send_message(MAIN_QUALIFIER_ID, text, reply_markup=keyboard_main_qualifier(lead_id))
+
+        # Если лид уже передан второму — напомнить и ему
+        if lead["status"] == "ASSIGNED" and lead["assigned_to"] == SECOND_QUALIFIER_ID:
+            send_message(SECOND_QUALIFIER_ID, text, reply_markup=keyboard_second_qualifier(lead_id))
+
+        # Уведомление в группу
+        send_message(NOTIFY_GROUP_ID,
+            f"⏰ Необработанный лид #{n} напоминание\n"
+            f"📞 {html_lib.escape(call_phone)} | ожидает {elapsed} мин."
+        )
+
         try:
             db_increment_reminder(lead_id)
         except Exception as exc:
@@ -485,12 +499,12 @@ def send_followups():
             continue
 
         for lead in leads:
-            lead_id    = lead["lead_id"]
+            lead_id     = lead["lead_id"]
             assigned_to = lead.get("assigned_to") or MAIN_QUALIFIER_ID
-            call_phone = normalize_phone(lead["phone"])
-            e_phone    = html_lib.escape(call_phone)
-            e_name     = html_lib.escape(str(lead["name"]))
-            round_num  = lead["reminder_count"] + 1
+            call_phone  = normalize_phone(lead["phone"])
+            e_phone     = html_lib.escape(call_phone)
+            e_name      = html_lib.escape(str(lead["name"]))
+            round_num   = lead["reminder_count"] + 1
 
             fu_text = (
                 f"📋 <b>{label} follow-up</b>\n\n"
@@ -522,6 +536,11 @@ def webhook():
     return "ok", 200
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "time": datetime.now().isoformat()}, 200
+
+
 def handle_message(msg):
     sender    = msg.get("from", {})
     chat_id   = msg.get("chat", {}).get("id") or sender.get("id")
@@ -539,11 +558,12 @@ def handle_message(msg):
                 today_count = cur.fetchone()["cnt"]
                 cur.execute("SELECT COUNT(*) as cnt FROM leads WHERE created_at >= %s", (month_start,))
                 month_count = cur.fetchone()["cnt"]
+                # FIX: считаем и FOLLOWUP_DONE как квалифицированные
                 cur.execute("SELECT COUNT(*) as cnt FROM leads WHERE status IN ('QUALIFIED','FOLLOWUP_DONE')")
                 qual_count = cur.fetchone()["cnt"]
                 cur.execute("SELECT COUNT(*) as cnt FROM leads WHERE status = 'DONE'")
                 done_count = cur.fetchone()["cnt"]
-                cur.execute("SELECT COUNT(*) as cnt FROM leads WHERE status = 'PENDING'")
+                cur.execute("SELECT COUNT(*) as cnt FROM leads WHERE status IN ('PENDING','ASSIGNED')")
                 pending_count = cur.fetchone()["cnt"]
                 cur.execute("""
                     SELECT processed_by, COUNT(*) as cnt FROM leads
@@ -552,7 +572,10 @@ def handle_message(msg):
                 by_user = cur.fetchall()
 
         qual_rate  = round(qual_count / max(qual_count + done_count, 1) * 100)
-        user_lines = "".join(f"  👤 {html_lib.escape(r['processed_by'])}: {r['cnt']}\n" for r in by_user if r['processed_by'])
+        user_lines = "".join(
+            f"  👤 {html_lib.escape(r['processed_by'])}: {r['cnt']}\n"
+            for r in by_user if r['processed_by']
+        )
 
         stats_text = (
             f"📊 <b>Статистика лидов</b>\n\n"
@@ -624,12 +647,31 @@ def handle_message(msg):
             # Report to owner
             _send_report(lead, user_label, qualified, full_reason)
 
-            # If qualified — set followup for the processor
+            # Уведомление в группу
+            e_call = html_lib.escape(normalize_phone(lead["phone"]))
+            e_name = html_lib.escape(str(lead["name"]))
+            send_message(NOTIFY_GROUP_ID,
+                f"{'✅' if qualified else '❌'} Лид обработан\n"
+                f"📞 {e_call} | {e_name}\n"
+                f"👤 {html_lib.escape(user_label)}\n"
+                f"💬 {html_lib.escape(reason)}"
+            )
+
+            # FIX: если квалифицирован — сразу обновляем updated_at чтобы follow-up
+            # отсчитывался от момента квалификации, а не создания лида
             if qualified:
                 processor_id = lead.get("assigned_to") or MAIN_QUALIFIER_ID
-                _send_followup_setup(lead_id, processor_id, user_label,
-                                     html_lib.escape(normalize_phone(lead["phone"])),
-                                     html_lib.escape(str(lead["name"])))
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE leads SET updated_at = NOW(), reminder_count = 0 WHERE lead_id = %s",
+                            (lead_id,)
+                        )
+                send_message(processor_id,
+                    f"📋 Follow-up напоминания запланированы:\n"
+                    f"• Через 1 день\n• Через 3 дня\n\n"
+                    f"Бот напомнит автоматически."
+                )
             return
 
         if state and state["state_type"] == "followup":
@@ -665,7 +707,6 @@ def handle_message(msg):
                 with get_db() as conn:
                     with conn.cursor() as cur:
                         cur.execute("UPDATE leads SET status='FOLLOWUP_DONE' WHERE lead_id=%s", (lead_id,))
-                    conn.commit()
                 send_message(OWNER_ID,
                     f"📊 <b>Финальный отчёт (3 дня)</b>\n\n"
                     f"{lead_info(lead_id, e_phone, e_name, lead['date_str'])}\n\n"
@@ -710,15 +751,25 @@ def handle_message(msg):
         except Exception as exc:
             logger.error("[Sheets] insert failed: %s", exc)
 
-        # Новый лид — отправляем владельцу и главному квалификатору
         new_lead_text = (
             f"📋 <b>Новый лид</b>\n\n"
             f"{lead_info(lead_id, e_call, e_name2, date_str)}\n"
             f"👤 Кто скинул: {e_sender}\n\n"
             f"Примите или отклоните:"
         )
-        send_message(OWNER_ID, f"📥 <b>Новый лид получен</b>\n\n{lead_info(lead_id, e_call, e_name2, date_str)}\n👤 Кто скинул: {e_sender}")
+        # Владельцу — только уведомление без кнопок
+        send_message(OWNER_ID,
+            f"📥 <b>Новый лид получен</b>\n\n"
+            f"{lead_info(lead_id, e_call, e_name2, date_str)}\n"
+            f"👤 Кто скинул: {e_sender}"
+        )
+        # Главному квалификатору — с кнопками
         send_message(MAIN_QUALIFIER_ID, new_lead_text, reply_markup=keyboard_main_qualifier(lead_id))
+
+        # Уведомление в группу
+        send_message(NOTIFY_GROUP_ID,
+            f"📥 Новый лид\n📞 {e_call} | {e_name2}\n👤 От: {e_sender}"
+        )
 
         logger.info("[AutoSave] lead_id=%s phone=%s name=%s", lead_id, phone, name)
 
@@ -750,7 +801,6 @@ def handle_callback(cb):
             send_message(chat_id, "ℹ️ Лид уже обработан.")
             return
 
-        # Атомарно захватываем
         claimed = db_claim_lead(lead_id, user_label, chat_id)
         if not claimed:
             send_message(chat_id, "ℹ️ Лид уже взят.")
@@ -759,7 +809,6 @@ def handle_callback(cb):
         e_call = html_lib.escape(normalize_phone(lead["phone"]))
         e_name = html_lib.escape(str(lead["name"]))
 
-        # Отправляем этап квалификации
         qual_text = (
             f"📋 <b>Этап квалификации</b>\n\n"
             f"{lead_info(lead_id, e_call, e_name, lead['date_str'])}\n\n"
@@ -784,21 +833,24 @@ def handle_callback(cb):
             send_message(chat_id, "ℹ️ Лид уже обработан.")
             return
 
-        # Передаём второму квалификатору
         db_assign_lead(lead_id, SECOND_QUALIFIER_ID)
 
         e_call = html_lib.escape(normalize_phone(lead["phone"]))
         e_name = html_lib.escape(str(lead["name"]))
 
         send_message(chat_id, f"↩️ Лид передан второму квалификатору.")
-
-        second_text = (
+        send_message(SECOND_QUALIFIER_ID,
             f"📋 <b>Новый лид для вас</b>\n\n"
             f"{lead_info(lead_id, e_call, e_name, lead['date_str'])}\n\n"
-            f"Примите лид:"
+            f"Примите лид:",
+            reply_markup=keyboard_second_qualifier(lead_id)
         )
-        send_message(SECOND_QUALIFIER_ID, second_text, reply_markup=keyboard_second_qualifier(lead_id))
-        send_message(OWNER_ID, f"↩️ Лид <code>{lead_id}</code> отклонён главным, передан второму квалификатору.")
+        send_message(OWNER_ID,
+            f"↩️ Лид <code>{lead_id}</code> отклонён главным, передан второму квалификатору."
+        )
+        send_message(NOTIFY_GROUP_ID,
+            f"↩️ Лид {lead_id} отклонён главным → передан второму квалификатору"
+        )
         logger.info("[Reject] lead=%s transferred to second qualifier", lead_id)
 
     # ── Квалификация ─────────────────────────────────────────────────────────
@@ -817,14 +869,11 @@ def handle_callback(cb):
             return
 
         qualified = (verdict == "yes")
+        db_set_pending_reason(chat_id, lead_id, qualified, user_label)
 
         if not qualified:
-            # Не квалифицирован — сразу просим причину
-            db_set_pending_reason(chat_id, lead_id, False, user_label)
             send_message(chat_id, "❌ <b>Не квалифицированный</b>\n\nНапишите причину:")
         else:
-            # Квалифицирован — просим причину
-            db_set_pending_reason(chat_id, lead_id, True, user_label)
             send_message(chat_id, "✅ <b>Квалифицированный</b>\n\nНапишите причину / комментарий:")
 
         logger.info("[Qual] verdict=%s lead=%s by %s", verdict, lead_id, user_label)
@@ -855,20 +904,6 @@ def _send_report(lead, processed_by, qualified, reason):
         logger.error("[Report] Failed: %s", exc)
 
 
-def _send_followup_setup(lead_id, processor_id, processed_by, e_phone, e_name):
-    fu_text = (
-        f"📋 <b>Follow-up через 1 день</b>\n\n"
-        f"🆔 ID: <code>{lead_id}</code>\n"
-        f"📞 Телефон: {e_phone}\n"
-        f"👤 Имя: {e_name}\n\n"
-        f"Что с лидом? На каком этапе?\n"
-        f"<i>Напишите ответ текстом</i>"
-    )
-    # Планируем — бот пришлёт через scheduler
-    # Здесь только записываем что followup нужен (через update_at и reminder_count=0)
-    logger.info("[FollowUp] Scheduled for lead=%s processor=%d", lead_id, processor_id)
-
-
 # ─── Webhook setup ────────────────────────────────────────────────────────────
 
 def set_webhook():
@@ -887,16 +922,29 @@ def set_webhook():
 
 # ─── Entry ────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
     init_db()
     set_webhook()
 
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(send_reminders, "interval", minutes=REMINDER_INTERVAL_MIN, id="reminders")
-    scheduler.add_job(send_followups,  "interval", hours=1,                       id="followups")
+    scheduler.add_job(send_followups,  "interval", hours=1, id="followups")
     scheduler.start()
     logger.info("[Scheduler] Started")
 
     port = int(os.environ.get("PORT", 8080))
     logger.info("Starting Flask on port %d", port)
     app.run(host="0.0.0.0", port=port)
+
+
+# FIX: инициализация при запуске через gunicorn тоже
+init_db()
+set_webhook()
+_scheduler = BackgroundScheduler(timezone="UTC")
+_scheduler.add_job(send_reminders, "interval", minutes=REMINDER_INTERVAL_MIN, id="reminders")
+_scheduler.add_job(send_followups,  "interval", hours=1, id="followups")
+_scheduler.start()
+
+
+if __name__ == "__main__":
+    main()
