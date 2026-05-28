@@ -178,6 +178,12 @@ def keyboard_qual(lead_id):
         {"text": "❌ Не квалифицированный", "callback_data": f"qual|no|{lead_id}"},
     ]]}
 
+def keyboard_delete_confirm(lead_id):
+    return {"inline_keyboard": [[
+        {"text": "🗑 Да, удалить", "callback_data": f"delete_confirm|{lead_id}"},
+        {"text": "❌ Отмена",      "callback_data": f"delete_cancel|{lead_id}"},
+    ]]}
+
 # ─── Google Sheets ────────────────────────────────────────────────────────────
 
 def get_sheets():
@@ -629,7 +635,11 @@ def handle_message(msg):
         except Exception as e: logger.error("[Sheets] %s", e)
         # Владельцу — уведомление + кнопки
         send_message(OWNER_ID, f"📥 <b>Новый лид получен</b>\n\n{lead_info(lead_id,e_call,e_name,date_str)}\n👤 Кто скинул: {e_sender}\n\nПримите или отклоните:",
-                     reply_markup=keyboard_main(lead_id))
+                     reply_markup={"inline_keyboard": [
+                         [{"text": "✅ Принять", "callback_data": f"accept|{lead_id}"},
+                          {"text": "❌ Отказать", "callback_data": f"reject|{lead_id}"}],
+                         [{"text": "🗑 Удалить лид", "callback_data": f"delete|{lead_id}"}]
+                     ]})
         # Главному квалификатору — с кнопками
         send_message(MAIN_QUALIFIER_ID, f"📋 <b>Новый лид</b>\n\n{lead_info(lead_id,e_call,e_name,date_str)}\n👤 Кто скинул: {e_sender}\n\nПримите или отклоните:",
                      reply_markup=keyboard_main(lead_id))
@@ -679,6 +689,35 @@ def handle_callback(cb):
         db_set_pending_reason(chat_id, lead_id, qualified, user_label)
         send_message(chat_id, "✅ <b>Квалифицированный</b>\n\nНапишите комментарий:" if qualified
                      else "❌ <b>Не квалифицированный</b>\n\nНапишите причину:")
+
+    elif cb_data.startswith("delete|"):
+        if chat_id != OWNER_ID: send_message(chat_id, "⛔ Нет прав."); return
+        lead_id = cb_data.split("|", 1)[1]
+        lead = db_find_lead(lead_id)
+        if not lead: send_message(chat_id, "❌ Лид не найден."); return
+        e_call = html_lib.escape(normalize_phone(lead["phone"]))
+        e_name = html_lib.escape(str(lead["name"]))
+        send_message(chat_id,
+            f"🗑 <b>Удалить лид?</b>\n\n{lead_info(lead_id, e_call, e_name, lead['date_str'])}\n\n"
+            f"⚠️ Лид будет удалён из базы данных.",
+            reply_markup=keyboard_delete_confirm(lead_id))
+
+    elif cb_data.startswith("delete_confirm|"):
+        if chat_id != OWNER_ID: send_message(chat_id, "⛔ Нет прав."); return
+        lead_id = cb_data.split("|", 1)[1]
+        lead = db_find_lead(lead_id)
+        if not lead: send_message(chat_id, "❌ Лид не найден."); return
+        e_call = html_lib.escape(normalize_phone(lead["phone"]))
+        e_name = html_lib.escape(str(lead["name"]))
+        with get_db() as conn:
+            qrun(conn, "DELETE FROM leads WHERE lead_id=%s", [lead_id])
+            qrun(conn, "DELETE FROM pending_states WHERE lead_id=%s", [lead_id])
+        send_message(chat_id, f"🗑 Лид удалён: {e_call} | {e_name}")
+        logger.info("[Delete] lead=%s deleted by owner", lead_id)
+
+    elif cb_data.startswith("delete_cancel|"):
+        if chat_id != OWNER_ID: send_message(chat_id, "⛔ Нет прав."); return
+        send_message(chat_id, "✅ Удаление отменено.")
 
 def _send_report(lead, processed_by, qualified, reason):
     try:
