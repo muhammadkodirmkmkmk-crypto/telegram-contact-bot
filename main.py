@@ -127,21 +127,21 @@ def db_insert_lead(lead_id, date_str, name, phone):
     with get_db() as conn:
         conn.run("""
             INSERT INTO leads (lead_id, date_str, name, phone, status, created_at, updated_at)
-            VALUES (:1, :2, :3, :4, 'PENDING', NOW(), NOW())
+            VALUES ($1, $2, $3, $4, 'PENDING', NOW(), NOW())
             ON CONFLICT (lead_id) DO NOTHING
         """, lead_id, date_str, name or '', phone)
 
 
 def db_find_lead(lead_id):
     with get_db() as conn:
-        return fetchone_dict(conn, "SELECT * FROM leads WHERE lead_id = :1", [lead_id])
+        return fetchone_dict(conn, "SELECT * FROM leads WHERE lead_id = $1", [lead_id])
 
 
 def db_assign_lead(lead_id, qualifier_id):
     with get_db() as conn:
         conn.run("""
-            UPDATE leads SET assigned_to = :1, status = 'ASSIGNED', updated_at = NOW()
-            WHERE lead_id = :2
+            UPDATE leads SET assigned_to = $1, status = 'ASSIGNED', updated_at = NOW()
+            WHERE lead_id = $2
         """, qualifier_id, lead_id)
 
 
@@ -149,8 +149,8 @@ def db_claim_lead(lead_id, user_label, qualifier_id):
     with get_db() as conn:
         conn.run("""
             UPDATE leads
-            SET status = 'PROCESSING', processed_by = :1, assigned_to = :2, updated_at = NOW()
-            WHERE lead_id = :3 AND status IN ('PENDING', 'ASSIGNED')
+            SET status = 'PROCESSING', processed_by = $1, assigned_to = $2, updated_at = NOW()
+            WHERE lead_id = $3 AND status IN ('PENDING', 'ASSIGNED')
         """, user_label, qualifier_id, lead_id)
         return conn.row_count > 0
 
@@ -159,14 +159,14 @@ def db_mark_processed(lead_id, reason, qualified):
     status = 'QUALIFIED' if qualified else 'DONE'
     with get_db() as conn:
         conn.run("""
-            UPDATE leads SET status = :1, reason = :2, updated_at = NOW(), reminder_count = 0
-            WHERE lead_id = :3
+            UPDATE leads SET status = $1, reason = $2, updated_at = NOW(), reminder_count = 0
+            WHERE lead_id = $3
         """, status, reason, lead_id)
 
 
 def db_advance_followup(lead_id, new_round):
     with get_db() as conn:
-        conn.run("UPDATE leads SET reminder_count = :1, updated_at = NOW() WHERE lead_id = :2",
+        conn.run("UPDATE leads SET reminder_count = $1, updated_at = NOW() WHERE lead_id = $2",
                  new_round, lead_id)
 
 
@@ -175,7 +175,7 @@ def db_get_pending_leads():
     with get_db() as conn:
         return fetchall_dict(conn, """
             SELECT * FROM leads
-            WHERE status IN ('PENDING', 'ASSIGNED') AND updated_at <= :1
+            WHERE status IN ('PENDING', 'ASSIGNED') AND updated_at <= $1
         """, [cutoff])
 
 
@@ -185,20 +185,20 @@ def db_get_qualified_for_followup(days):
     with get_db() as conn:
         return fetchall_dict(conn, """
             SELECT * FROM leads
-            WHERE status = 'QUALIFIED' AND reminder_count = :1 AND updated_at <= :2
+            WHERE status = 'QUALIFIED' AND reminder_count = $1 AND updated_at <= $2
         """, [expected_round, cutoff])
 
 
 def db_set_sheet_row(lead_id, sheet_row):
     with get_db() as conn:
-        conn.run("UPDATE leads SET sheet_row = :1 WHERE lead_id = :2", sheet_row, lead_id)
+        conn.run("UPDATE leads SET sheet_row = $1 WHERE lead_id = $2", sheet_row, lead_id)
 
 
 def db_increment_reminder(lead_id):
     with get_db() as conn:
         conn.run("""
             UPDATE leads SET reminder_count = reminder_count + 1, updated_at = NOW()
-            WHERE lead_id = :1
+            WHERE lead_id = $1
         """, lead_id)
 
 
@@ -208,9 +208,9 @@ def db_set_pending_reason(chat_id, lead_id, qualified, user_label):
     with get_db() as conn:
         conn.run("""
             INSERT INTO pending_states (chat_id, state_type, lead_id, qualified, user_label, created_at)
-            VALUES (:1, 'reason', :2, :3, :4, NOW())
+            VALUES ($1, 'reason', $2, $3, $4, NOW())
             ON CONFLICT (chat_id) DO UPDATE
-            SET state_type='reason', lead_id=:2, qualified=:3, user_label=:4, created_at=NOW()
+            SET state_type='reason', lead_id=$2, qualified=$3, user_label=$4, created_at=NOW()
         """, chat_id, lead_id, qualified, user_label)
 
 
@@ -218,20 +218,20 @@ def db_set_pending_followup(chat_id, lead_id, followup_round, user_label):
     with get_db() as conn:
         conn.run("""
             INSERT INTO pending_states (chat_id, state_type, lead_id, followup_round, user_label, created_at)
-            VALUES (:1, 'followup', :2, :3, :4, NOW())
+            VALUES ($1, 'followup', $2, $3, $4, NOW())
             ON CONFLICT (chat_id) DO UPDATE
-            SET state_type='followup', lead_id=:2, followup_round=:3, user_label=:4, created_at=NOW()
+            SET state_type='followup', lead_id=$2, followup_round=$3, user_label=$4, created_at=NOW()
         """, chat_id, lead_id, followup_round, user_label)
 
 
 def db_get_pending_state(chat_id):
     with get_db() as conn:
-        return fetchone_dict(conn, "SELECT * FROM pending_states WHERE chat_id = :1", [chat_id])
+        return fetchone_dict(conn, "SELECT * FROM pending_states WHERE chat_id = $1", [chat_id])
 
 
 def db_clear_pending_state(chat_id):
     with get_db() as conn:
-        conn.run("DELETE FROM pending_states WHERE chat_id = :1", chat_id)
+        conn.run("DELETE FROM pending_states WHERE chat_id = $1", chat_id)
 
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
@@ -540,8 +540,8 @@ def handle_message(msg):
         month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         with get_db() as conn:
             total         = fetchone_dict(conn, "SELECT COUNT(*) as cnt FROM leads")["cnt"]
-            today_count   = fetchone_dict(conn, "SELECT COUNT(*) as cnt FROM leads WHERE date_str = :1", [today])["cnt"]
-            month_count   = fetchone_dict(conn, "SELECT COUNT(*) as cnt FROM leads WHERE created_at >= :1", [month_start])["cnt"]
+            today_count   = fetchone_dict(conn, "SELECT COUNT(*) as cnt FROM leads WHERE date_str = $1", [today])["cnt"]
+            month_count   = fetchone_dict(conn, "SELECT COUNT(*) as cnt FROM leads WHERE created_at >= $1", [month_start])["cnt"]
             qual_count    = fetchone_dict(conn, "SELECT COUNT(*) as cnt FROM leads WHERE status IN ('QUALIFIED','FOLLOWUP_DONE')")["cnt"]
             done_count    = fetchone_dict(conn, "SELECT COUNT(*) as cnt FROM leads WHERE status = 'DONE'")["cnt"]
             pending_count = fetchone_dict(conn, "SELECT COUNT(*) as cnt FROM leads WHERE status IN ('PENDING','ASSIGNED')")["cnt"]
@@ -567,7 +567,7 @@ def handle_message(msg):
     if text_body and text_body.startswith("/resend_today") and chat_id == OWNER_ID:
         today = datetime.now().strftime("%d.%m.%Y")
         with get_db() as conn:
-            leads = fetchall_dict(conn, "SELECT * FROM leads WHERE date_str = :1", [today])
+            leads = fetchall_dict(conn, "SELECT * FROM leads WHERE date_str = $1", [today])
         if not leads:
             send_message(OWNER_ID, f"ℹ️ Сегодня ({today}) лидов нет.")
             return
@@ -616,7 +616,7 @@ def handle_message(msg):
             if qualified:
                 processor_id = lead.get("assigned_to") or MAIN_QUALIFIER_ID
                 with get_db() as conn:
-                    conn.run("UPDATE leads SET updated_at = NOW(), reminder_count = 0 WHERE lead_id = :1", lead_id)
+                    conn.run("UPDATE leads SET updated_at = NOW(), reminder_count = 0 WHERE lead_id = $1", lead_id)
                 send_message(processor_id,
                     "📋 Follow-up напоминания запланированы:\n• Через 1 день\n• Через 3 дня\n\nБот напомнит автоматически.")
             return
@@ -646,7 +646,7 @@ def handle_message(msg):
             else:
                 db_advance_followup(lead_id, followup_round)
                 with get_db() as conn:
-                    conn.run("UPDATE leads SET status='FOLLOWUP_DONE' WHERE lead_id=:1", lead_id)
+                    conn.run("UPDATE leads SET status='FOLLOWUP_DONE' WHERE lead_id=$1", lead_id)
                 send_message(OWNER_ID,
                     f"📊 <b>Финальный отчёт (3 дня)</b>\n\n"
                     f"{lead_info(lead_id, e_phone, e_name, lead['date_str'])}\n\n"
