@@ -867,7 +867,8 @@ def handle_callback(cb):
     message_id = cb["message"]["message_id"]
 
     answer_callback(cb_id)
-    edit_message_reply_markup(chat_id, message_id)
+    if not cb_data.startswith("working|"):
+            edit_message_reply_markup(chat_id, message_id)
 
     # ── Save lead ────────────────────────────────────────────────────────────
     if cb_data.startswith("save|"):
