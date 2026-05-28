@@ -415,9 +415,11 @@ def handle_message(msg):
                 except Exception as e: logger.error("[Sheets] %s", e)
             _send_report(lead, user_label, qualified, full_reason)
             ep = html_lib.escape(normalize_phone(lead["phone"])); en = html_lib.escape(str(lead["name"]))
-            # В группу — только краткий итог
+            # В группу — итог + причина
             send_message(NOTIFY_GROUP_ID,
-                f"{'✅' if qualified else '❌'} Лид обработан: {ep} | {en}")
+                f"{'✅' if qualified else '❌'} <b>Лид обработан</b>\n"
+                f"📞 {ep} | 👤 {en}\n"
+                f"💬 Причина: {html_lib.escape(reason)}")
             if qualified:
                 proc_id = lead.get("assigned_to") or MAIN_QUALIFIER_ID
                 with get_db() as conn:
