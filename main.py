@@ -1,6 +1,11 @@
 import os, re, json, html as html_lib, logging, time
 import pg8000
 import urllib.parse
+import warnings
+warnings.filterwarnings("ignore", message="file_cache is only supported with oauth2client<4.0.0")
+# Suppress googleapiclient cache warning
+import logging as _logging
+_logging.getLogger("googleapiclient.discovery_cache").setLevel(_logging.ERROR)
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from flask import Flask, request
@@ -433,6 +438,8 @@ def handle_message(msg):
         try:
             with get_db() as conn:
                 all_leads = qall(conn, "SELECT * FROM leads ORDER BY created_at ASC")
+            # Сортируем от старых к новым — вставка каждого нового лида
+            # сдвигает предыдущие вниз, итого самый новый окажется сверху
             
             synced = 0
             updated = 0
