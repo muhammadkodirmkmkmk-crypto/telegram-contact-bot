@@ -640,12 +640,49 @@ def _send_report(lead, processed_by, qualified, reason):
             f"📋 {'✅ Квалифицированный' if qualified else '❌ Не квалифицированный'}\n💬 {html_lib.escape(str(reason))}")
     except Exception as e: logger.error("[Report] %s", e)
 
+def set_commands():
+    """Устанавливает меню команд для каждой роли."""
+    # Команды для владельца
+    owner_commands = [
+        {"command": "stats",        "description": "📊 Полная статистика"},
+        {"command": "today",        "description": "📅 Статистика за 24 часа"},
+        {"command": "sync_sheets",  "description": "🔄 Синхронизировать с Google Sheets"},
+        {"command": "resend_today", "description": "📤 Переотправить лиды за сегодня"},
+    ]
+    # Команды для квалификаторов
+    qualifier_commands = [
+        {"command": "stats", "description": "📊 Статистика"},
+        {"command": "today", "description": "📅 Статистика за 24 часа"},
+    ]
+
+    # Владельцу
+    requests.post(f"{API_BASE}/setMyCommands", json={
+        "commands": owner_commands,
+        "scope": {"type": "chat", "chat_id": OWNER_ID}
+    }, timeout=10)
+
+    # Главному квалификатору
+    requests.post(f"{API_BASE}/setMyCommands", json={
+        "commands": qualifier_commands,
+        "scope": {"type": "chat", "chat_id": MAIN_QUALIFIER_ID}
+    }, timeout=10)
+
+    # Второму квалификатору
+    requests.post(f"{API_BASE}/setMyCommands", json={
+        "commands": qualifier_commands,
+        "scope": {"type": "chat", "chat_id": SECOND_QUALIFIER_ID}
+    }, timeout=10)
+
+    logger.info("[Commands] Menu set for all users")
+
+
 def set_webhook():
     endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
     resp = requests.post(f"{API_BASE}/setWebhook",
         json={"url": endpoint, "allowed_updates": ["message","callback_query"]}, timeout=10)
     result = resp.json()
     logger.info("Webhook %s: %s", "set" if result.get("ok") else "FAILED", endpoint)
+    set_commands()
 
 def main():
     init_db(); set_webhook()
