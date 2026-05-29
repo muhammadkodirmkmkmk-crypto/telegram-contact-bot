@@ -538,15 +538,19 @@ def handle_message(msg):
             elapsed = int((datetime.now() - lead["created_at"]).total_seconds() / 60)
             hours, mins = divmod(elapsed, 60)
             time_str = f"{hours}ч {mins}мин" if hours else f"{mins}мин"
-            kb = {"inline_keyboard": [
-                [{"text": "✅ Принять",  "callback_data": f"accept|{lid}"},
-                 {"text": "❌ Отказать", "callback_data": f"reject|{lid}"}],
-                [{"text": "📞 Перезвонить", "callback_data": f"callback|{lid}"}],
-            ]} if chat_id == OWNER_ID else {"inline_keyboard": [
-                [{"text": "✅ Принять",  "callback_data": f"accept|{lid}"},
-                 {"text": "❌ Отказать", "callback_data": f"reject|{lid}"}],
-                [{"text": "📞 Перезвонить", "callback_data": f"callback|{lid}"}],
-            ]}
+            if chat_id == OWNER_ID:
+                kb = {"inline_keyboard": [
+                    [{"text": "✅ Принять",  "callback_data": f"accept|{lid}"},
+                     {"text": "❌ Отказать", "callback_data": f"reject|{lid}"}],
+                    [{"text": "📞 Перезвонить", "callback_data": f"callback|{lid}"}],
+                    [{"text": "🗑 Удалить лид", "callback_data": f"delete|{lid}"}],
+                ]}
+            else:
+                kb = {"inline_keyboard": [
+                    [{"text": "✅ Принять",  "callback_data": f"accept|{lid}"},
+                     {"text": "❌ Отказать", "callback_data": f"reject|{lid}"}],
+                    [{"text": "📞 Перезвонить", "callback_data": f"callback|{lid}"}],
+                ]}
             info = lead_info(lid, ep, en, lead["date_str"])
             info = lead_info(lid, ep, en, lead["date_str"])
             txt = "⏳ <b>Ожидает " + time_str + "</b>\n" + info
