@@ -164,10 +164,11 @@ def db_clear_pending_state(chat_id):
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def keyboard_main(lead_id):
-    return {"inline_keyboard": [[
-        {"text": "✅ Принять",  "callback_data": f"accept|{lead_id}"},
-        {"text": "❌ Отказать", "callback_data": f"reject|{lead_id}"},
-    ]]}
+    return {"inline_keyboard": [
+        [{"text": "✅ Принять",  "callback_data": f"accept|{lead_id}"},
+         {"text": "❌ Отказать", "callback_data": f"reject|{lead_id}"}],
+        [{"text": "📞 Перезвонить", "callback_data": f"callback|{lead_id}"}],
+    ]}
 
 def keyboard_second(lead_id):
     return {"inline_keyboard": [[{"text": "✅ Принять", "callback_data": f"accept|{lead_id}"}]]}
@@ -519,6 +520,40 @@ def handle_message(msg):
             f"📈 Конверсия: <b>{rate}%</b>")
         return
 
+    # /pending — список необработанных лидов
+    if text_body and text_body.startswith("/pending") and chat_id in (OWNER_ID, MAIN_QUALIFIER_ID):
+        with get_db() as conn:
+            leads = qall(conn, """
+                SELECT * FROM leads WHERE status IN ('PENDING','ASSIGNED')
+                ORDER BY created_at ASC
+            """)
+        if not leads:
+            send_message(chat_id, "✅ Необработанных лидов нет!")
+            return
+        send_message(chat_id, f"⏳ <b>Необработанных лидов: {len(leads)}</b>")
+        for lead in leads:
+            lid    = lead["lead_id"]
+            ep     = html_lib.escape(normalize_phone(lead["phone"]))
+            en     = html_lib.escape(str(lead["name"] or ""))
+            elapsed = int((datetime.now() - lead["created_at"]).total_seconds() / 60)
+            hours, mins = divmod(elapsed, 60)
+            time_str = f"{hours}ч {mins}мин" if hours else f"{mins}мин"
+            kb = {"inline_keyboard": [
+                [{"text": "✅ Принять",  "callback_data": f"accept|{lid}"},
+                 {"text": "❌ Отказать", "callback_data": f"reject|{lid}"}],
+                [{"text": "📞 Перезвонить", "callback_data": f"callback|{lid}"}],
+            ]} if chat_id == OWNER_ID else {"inline_keyboard": [
+                [{"text": "✅ Принять",  "callback_data": f"accept|{lid}"},
+                 {"text": "❌ Отказать", "callback_data": f"reject|{lid}"}],
+                [{"text": "📞 Перезвонить", "callback_data": f"callback|{lid}"}],
+            ]}
+            info = lead_info(lid, ep, en, lead["date_str"])
+            info = lead_info(lid, ep, en, lead["date_str"])
+            txt = "⏳ <b>Ожидает " + time_str + "</b>\n" + info
+            send_message(chat_id, txt,
+                reply_markup=kb)
+        return
+
     # /delete <lead_id> — удалить лид по ID (только владелец)
     if text_body and text_body.startswith("/delete") and chat_id == OWNER_ID:
         parts = text_body.strip().split()
@@ -725,6 +760,31 @@ def handle_callback(cb):
         send_message(chat_id, "✅ <b>Квалифицированный</b>\n\nНапишите комментарий:" if qualified
                      else "❌ <b>Не квалифицированный</b>\n\nНапишите причину:")
 
+    elif cb_data.startswith("callback|"):
+        if chat_id not in (OWNER_ID, MAIN_QUALIFIER_ID): 
+            send_message(chat_id, "⛔ Нет прав."); return
+        lead_id = cb_data.split("|", 1)[1]
+        lead = db_find_lead(lead_id)
+        if not lead: send_message(chat_id, "❌ Лид не найден."); return
+        ep = html_lib.escape(normalize_phone(lead["phone"]))
+        en = html_lib.escape(str(lead["name"] or ""))
+        # Отметить в БД что перезвонили
+        with get_db() as conn:
+            qrun(conn, """UPDATE leads SET reason=COALESCE(NULLIF(reason,''),'')||%s 
+                 WHERE lead_id=%s""",
+                 [f"[📞 Перезвонить отмечено {datetime.now().strftime('%d.%m %H:%M')} — {user_label}] ", lead_id])
+        send_message(chat_id,
+            "\U0001F4DE <b>\u041e\u0442\u043c\u0435\u0447\u0435\u043d\u043e: \u043d\u0443\u0436\u043d\u043e \u043f\u0435\u0440\u0435\u0437\u0432\u043e\u043d\u0438\u0442\u044c</b>\n"
+            + "\U0001F4DE " + ep + " | \U0001F464 " + en + "\n"
+            + "\U0001F550 " + datetime.now().strftime('%d.%m.%Y %H:%M'))
+        # \u0423\u0432\u0435\u0434\u043e\u043c\u0438\u0442\u044c \u0432\u043b\u0430\u0434\u0435\u043b\u044c\u0446\u0430 \u0435\u0441\u043b\u0438 \u043e\u0442\u043c\u0435\u0442\u0438\u043b \u043a\u0432\u0430\u043b\u0438\u0444\u0438\u043a\u0430\u0442\u043e\u0440
+        if chat_id != OWNER_ID:
+            send_message(OWNER_ID,
+                "\U0001F4DE <b>" + html_lib.escape(user_label) + " \u043e\u0442\u043c\u0435\u0442\u0438\u043b: \u043f\u0435\u0440\u0435\u0437\u0432\u043e\u043d\u0438\u0442\u044c</b>\n"
+                + lead_info(lead_id, ep, en, lead["date_str"]))
+
+    elif cb_data.startswith("delete|"):
+        if chat_id != OWNER_ID: send_message(chat_id, "\u26d4 \u041d\u0435\u0442 \u043f\u0440\u0430\u0432."); return
     elif cb_data.startswith("delete|"):
         if chat_id != OWNER_ID: send_message(chat_id, "⛔ Нет прав."); return
         lead_id = cb_data.split("|", 1)[1]
@@ -771,14 +831,16 @@ def set_commands():
     owner_commands = [
         {"command": "stats",        "description": "📊 Полная статистика"},
         {"command": "today",        "description": "📅 Статистика за 24 часа"},
+        {"command": "pending",      "description": "⏳ Необработанные лиды"},
         {"command": "delete",       "description": "🗑 Удалить лид (последние 10)"},
         {"command": "sync_sheets",  "description": "🔄 Синхронизировать с Google Sheets"},
         {"command": "resend_today", "description": "📤 Переотправить лиды за сегодня"},
     ]
     # Команды для квалификаторов
     qualifier_commands = [
-        {"command": "stats", "description": "📊 Статистика"},
-        {"command": "today", "description": "📅 Статистика за 24 часа"},
+        {"command": "stats",   "description": "📊 Статистика"},
+        {"command": "today",   "description": "📅 Статистика за 24 часа"},
+        {"command": "pending", "description": "⏳ Необработанные лиды"},
     ]
 
     # Владельцу
